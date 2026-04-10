@@ -51,7 +51,7 @@ async def _interactive(url: str, token: str | None):
         f"Gateway: {url}",
         title="Connected", border_style="green",
     ))
-    console.print("[dim]Commands: /new /stop /status /quit /vault /config /tasks[/dim]\n")
+    console.print("[dim]Commands: /new /stop /status /quit /vault /config /tasks /file <path>[/dim]\n")
 
     session_id = "cli-default"
     sessions = {"cli-default": "Default"}
@@ -93,6 +93,11 @@ async def _interactive(url: str, token: str | None):
             sessions[session_id] = f"Chat {len(sessions)}"
             active = session_id
             console.print(f"[green]{result}[/green]")
+            continue
+
+        if text.startswith("/file "):
+            filepath = text.split(" ", 1)[1].strip()
+            await _send_file(client, filepath, active)
             continue
 
         if text == "/vault":
@@ -196,6 +201,48 @@ async def _tasks_menu(client: GatewayClient):
         console.print()
         table.add_row(t.get("name", "?"), t.get("cron", "?"), (t.get("prompt", ""))[:50])
     console.print(table)
+
+
+async def _send_file(client: GatewayClient, filepath: str, session_id: str):
+    """Upload a file and send it to the agent."""
+    import os
+    from pathlib import Path
+
+    p = Path(filepath).expanduser()
+    if not p.exists():
+        console.print(f"[red]File not found: {filepath}[/red]")
+        return
+
+    console.print(f"[dim]Uploading {p.name}...[/dim]")
+    try:
+        import aiohttp
+        form = aiohttp.FormData()
+        form.add_field('file', open(p, 'rb'), filename=p.name)
+        async with client._session.post(f"{client.base_url}/api/upload", data=form) as resp:
+            result = await resp.json()
+        remote_path = result["path"]
+        filename = result["filename"]
+    except Exception as e:
+        console.print(f"[red]Upload failed: {e}[/red]")
+        return
+
+    kind = "image" if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp") else "file"
+    msg = f"The user attached a file:\n- {kind}: {filename} — local path: {remote_path}\nUse the Read tool to inspect it."
+
+    console.print(f"[dim]📎 {filename} uploaded. Sending to agent...[/dim]")
+
+    async def on_status(s):
+        console.print(f"\r[dim]⏳ {s}[/dim]", end="")
+
+    response = await client.send_message(msg, session_id, on_status=on_status)
+    console.print("\r" + " " * 60 + "\r", end="")
+
+    resp_text = response.get("text", "")
+    if response.get("type") == "error":
+        console.print(f"[red]Error: {resp_text}[/red]")
+    else:
+        console.print(Markdown(resp_text))
+    console.print()
 
 
 def main():
