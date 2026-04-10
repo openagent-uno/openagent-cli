@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openagent-cli"
+version = "0.1.0"
+description = "CLI client for OpenAgent — connects to any OpenAgent Gateway"
+requires-python = ">=3.11"
+license = "MIT"
+
+dependencies = [
+    "aiohttp>=3.9",
+    "click>=8.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+openagent-cli = "openagent_cli.main:main"
