@@ -87,6 +87,22 @@ class GatewayClient:
         async with self._session.get(f"{self.base_url}{path}") as r:
             return await r.json()
 
-    async def rest_patch(self, path: str, data: dict) -> dict:
+    async def rest_patch(self, path: str, data) -> dict:
+        # `data` may be any JSON-serializable value (scalar, list, dict)
         async with self._session.patch(f"{self.base_url}{path}", json=data) as r:
             return await r.json()
+
+    async def rest_put(self, path: str, data) -> dict:
+        async with self._session.put(f"{self.base_url}{path}", json=data) as r:
+            return await r.json()
+
+    async def rest_post(self, path: str, data=None) -> dict:
+        async with self._session.post(f"{self.base_url}{path}", json=data if data is not None else {}) as r:
+            return await r.json()
+
+    async def rest_delete(self, path: str) -> dict:
+        async with self._session.delete(f"{self.base_url}{path}") as r:
+            try:
+                return await r.json()
+            except Exception:
+                return {"ok": r.status < 400}
