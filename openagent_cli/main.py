@@ -29,6 +29,18 @@ def cli():
     pass
 
 
+def _render_response(response: dict) -> None:
+    resp_text = response.get("text", "")
+    if response.get("type") == "error":
+        console.print(f"[red]Error: {resp_text}[/red]")
+    else:
+        console.print(Markdown(resp_text))
+        model = response.get("model")
+        if model:
+            console.print(f"[dim]Model: {model}[/dim]")
+    console.print()
+
+
 @cli.command()
 @click.argument("host_port", default="localhost:8765")
 @click.option("--token", "-t", default=None, help="Gateway auth token")
@@ -127,13 +139,7 @@ async def _interactive(url: str, token: str | None):
 
         response = await client.send_message(text, active, on_status=on_status)
         console.print("\r" + " " * 60 + "\r", end="")
-
-        resp_text = response.get("text", "")
-        if response.get("type") == "error":
-            console.print(f"[red]Error: {resp_text}[/red]")
-        else:
-            console.print(Markdown(resp_text))
-        console.print()
+        _render_response(response)
 
     await client.disconnect()
     console.print("[dim]Disconnected.[/dim]")
@@ -236,13 +242,7 @@ async def _send_file(client: GatewayClient, filepath: str, session_id: str):
 
     response = await client.send_message(msg, session_id, on_status=on_status)
     console.print("\r" + " " * 60 + "\r", end="")
-
-    resp_text = response.get("text", "")
-    if response.get("type") == "error":
-        console.print(f"[red]Error: {resp_text}[/red]")
-    else:
-        console.print(Markdown(resp_text))
-    console.print()
+    _render_response(response)
 
 
 def main():
