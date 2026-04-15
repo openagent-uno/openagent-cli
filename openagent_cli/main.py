@@ -93,7 +93,7 @@ def _print_help() -> None:
         ("/help", "Show this help"),
         ("/new", "Start a fresh conversation"),
         ("/sessions, /switch <id>", "List or switch sessions"),
-        ("/file <path>", "Upload a file/image to the agent"),
+        ("/file <path> [more...]", "Attach one or more files/images to the agent"),
         ("/stop", "Cancel the current operation"),
         ("/status", "Show agent status & queue"),
         ("/clear", "Clear the message queue"),
@@ -802,31 +802,65 @@ async def _usage_menu(client: GatewayClient):
 
 # ── File upload ──────────────────────────────────────────────────────────
 
-async def _send_file(client: GatewayClient, filepath: str, session_id: str):
-    """Upload a file and send it to the agent."""
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}
+
+
+def _kind_for(path: Path) -> str:
+    return "image" if path.suffix.lower() in IMAGE_SUFFIXES else "file"
+
+
+def _icon_for(kind: str) -> str:
+    return "🖼" if kind == "image" else "📎"
+
+
+def _render_attachments(items: list[tuple[str, str]]) -> None:
+    """Print a pretty echo of attachments about to be sent (list of (kind, filename))."""
+    chips = "  ".join(f"[cyan]{_icon_for(k)} {name}[/cyan]" for k, name in items)
+    label = "Attached" if len(items) == 1 else f"Attached ({len(items)})"
+    console.print(Panel(chips, title=label, border_style="cyan", padding=(0, 1)))
+
+
+async def _send_files(client: GatewayClient, filepaths: list[str], session_id: str):
+    """Upload one or more files and send them to the agent in a single message."""
     import aiohttp
 
-    p = Path(filepath).expanduser()
-    if not p.exists():
-        console.print(f"[red]File not found: {filepath}[/red]")
+    resolved: list[Path] = []
+    for fp in filepaths:
+        p = Path(fp).expanduser()
+        if not p.exists():
+            console.print(f"[red]File not found: {fp}[/red]")
+            continue
+        resolved.append(p)
+
+    if not resolved:
         return
 
-    console.print(f"[dim]Uploading {p.name}...[/dim]")
-    try:
-        form = aiohttp.FormData()
-        form.add_field('file', open(p, 'rb'), filename=p.name)
-        async with client._session.post(f"{client.base_url}/api/upload", data=form) as resp:
-            result = await resp.json()
-        remote_path = result["path"]
-        filename = result["filename"]
-    except Exception as e:
-        console.print(f"[red]Upload failed: {e}[/red]")
+    uploaded: list[tuple[str, str, str]] = []  # (kind, filename, remote_path)
+    for p in resolved:
+        console.print(f"[dim]Uploading {p.name}...[/dim]")
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", open(p, "rb"), filename=p.name)
+            async with client._session.post(f"{client.base_url}/api/upload", data=form) as resp:
+                result = await resp.json()
+            uploaded.append((_kind_for(p), result["filename"], result["path"]))
+        except Exception as e:
+            console.print(f"[red]Upload failed for {p.name}: {e}[/red]")
+
+    if not uploaded:
         return
 
-    kind = "image" if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp") else "file"
-    msg = f"The user attached a file:\n- {kind}: {filename} — local path: {remote_path}\nUse the Read tool to inspect it."
+    # Pretty echo of what's being sent
+    _render_attachments([(k, name) for k, name, _ in uploaded])
 
-    console.print(f"[dim]📎 {filename} uploaded. Sending to agent...[/dim]")
+    lines = [f"- {k}: {name} — local path: {path}" for k, name, path in uploaded]
+    noun = "a file" if len(uploaded) == 1 else f"{len(uploaded)} files"
+    inspect = "it" if len(uploaded) == 1 else "them"
+    msg = (
+        f"The user attached {noun}:\n"
+        + "\n".join(lines)
+        + f"\nUse the Read tool to inspect {inspect}."
+    )
 
     async def on_status(s):
         line = format_tool_status(s)
