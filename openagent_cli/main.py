@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -191,8 +192,15 @@ async def _interactive(url: str, token: str | None):
             continue
 
         if text.startswith("/file "):
-            filepath = text.split(" ", 1)[1].strip()
-            await _send_file(client, filepath, active)
+            rest = text.split(" ", 1)[1].strip()
+            try:
+                paths = shlex.split(rest)
+            except ValueError:
+                paths = rest.split()
+            if paths:
+                await _send_files(client, paths, active)
+            else:
+                console.print("[red]Usage: /file <path> [more paths...][/red]")
             continue
 
         if text == "/vault":
