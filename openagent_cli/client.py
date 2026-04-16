@@ -106,3 +106,29 @@ class GatewayClient:
                 return await r.json()
             except Exception:
                 return {"ok": r.status < 400}
+
+    async def download_file(self, remote_path: str, dest_path: str) -> int:
+        """Fetch a file off the agent's filesystem via ``/api/files``.
+
+        Used to materialise attachments the agent returned in a
+        ``response`` message when this CLI is connected to a remote
+        gateway and can't read the path directly. Writes to
+        ``dest_path`` and returns the number of bytes written.
+
+        Raises ``RuntimeError`` with the status/reason when the gateway
+        rejects the request (401 unauthorised, 404 not found, etc.)
+        so the caller can surface a clean error to the user.
+        """
+        params = {"path": remote_path}
+        if self.token:
+            params["token"] = self.token
+        async with self._session.get(f"{self.base_url}/api/files", params=params) as r:
+            if r.status != 200:
+                body = await r.text()
+                raise RuntimeError(f"{r.status} {body[:200]}")
+            total = 0
+            with open(dest_path, "wb") as f:
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    total += len(chunk)
+            return total

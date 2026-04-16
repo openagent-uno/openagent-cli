@@ -49,7 +49,7 @@ def format_tool_status(raw: str) -> str:
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def _render_response(response: dict) -> None:
+async def _render_response(response: dict, client: "GatewayClient | None" = None) -> None:
     resp_text = response.get("text", "")
     if response.get("type") == "error":
         console.print(f"[red]Error: {resp_text}[/red]")
@@ -58,6 +58,51 @@ def _render_response(response: dict) -> None:
         model = response.get("model")
         if model:
             console.print(f"[dim]Model: {model}[/dim]")
+
+    # Render attachments the agent attached to the response (via
+    # ``[IMAGE:/path]`` / ``[FILE:/path]`` / ``[VOICE:/path]`` /
+    # ``[VIDEO:/path]`` markers that the gateway stripped from the
+    # text and moved to a side-channel). The gateway gives us the
+    # absolute path as it exists on its own filesystem; locally
+    # colocated CLIs can read that path verbatim, remote CLIs need to
+    # fetch via ``/api/files``. We try local read first (zero copy,
+    # works for single-machine dev installs), then fall back to the
+    # HTTP download.
+    attachments = response.get("attachments") or []
+    if attachments and response.get("type") != "error":
+        console.print("[dim]Attachments:[/dim]")
+        for att in attachments:
+            remote_path = att.get("path", "")
+            filename = att.get("filename") or os.path.basename(remote_path) or "attachment"
+            kind = att.get("type", "file")
+            icon = {"image": "🖼", "voice": "🎤", "video": "🎬", "file": "📄"}.get(kind, "📎")
+
+            if remote_path and os.path.isfile(remote_path):
+                console.print(f"  {icon} [cyan]{filename}[/cyan] [dim]→ {remote_path}[/dim]")
+                continue
+
+            # Not reachable locally — download into cwd via /api/files.
+            if client is None:
+                console.print(f"  {icon} [yellow]{filename}[/yellow] [dim](remote: {remote_path}; no client bound to fetch)[/dim]")
+                continue
+            dest = Path.cwd() / filename
+            # Avoid clobbering an existing file with the same name by
+            # suffixing a counter — the agent may emit many files with
+            # generic names (report.pdf, screenshot.png, …) across a
+            # session.
+            if dest.exists():
+                stem = dest.stem
+                suffix = dest.suffix
+                for i in range(1, 1000):
+                    candidate = dest.with_name(f"{stem}-{i}{suffix}")
+                    if not candidate.exists():
+                        dest = candidate
+                        break
+            try:
+                bytes_written = await client.download_file(remote_path, str(dest))
+                console.print(f"  {icon} [green]{filename}[/green] [dim]→ {dest} ({bytes_written:,} bytes)[/dim]")
+            except Exception as e:  # noqa: BLE001 — inform user of any fetch failure, keep loop alive
+                console.print(f"  {icon} [red]{filename}[/red] [dim](download failed: {e})[/dim]")
     console.print()
 
 
@@ -255,7 +300,7 @@ async def _interactive(url: str, token: str | None):
 
         response = await client.send_message(text, active, on_status=on_status)
         console.print("\r" + " " * 80 + "\r", end="")
-        _render_response(response)
+        await _render_response(response, client=client)
 
     await client.disconnect()
     console.print("[dim]Disconnected.[/dim]")
@@ -868,7 +913,7 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
 
     response = await client.send_message(msg, session_id, on_status=on_status)
     console.print("\r" + " " * 80 + "\r", end="")
-    _render_response(response)
+    await _render_response(response, client=client)
 
 
 def main():
