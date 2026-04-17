@@ -609,134 +609,211 @@ async def _tasks_menu(client: GatewayClient):
 
 # ── MCPs ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MCPS = [
-    "vault", "filesystem", "editor", "web-search", "shell",
-    "computer-control", "chrome-devtools", "messaging", "scheduler",
-]
-
 
 async def _mcps_menu(client: GatewayClient):
-    while True:
-        cfg = await client.rest_get("/api/config")
-        disabled = set(cfg.get("mcp_disable", []) or [])
-        custom = cfg.get("mcp", []) or []
+    """MCP registry editor — DB-backed (hot-reloaded on the next message).
 
-        table = Table(title="Default MCPs")
+    Reads from /api/mcps (the ``mcps`` SQLite table). The yaml ``mcp:``
+    section is now read-only: first-boot bootstrap copies it into the DB,
+    subsequent edits go through this menu or the mcp-manager MCP and
+    take effect without a restart.
+    """
+    while True:
+        data = await client.rest_get("/api/mcps")
+        rows = data.get("mcps", []) or []
+
+        table = Table(title=f"MCPs ({len(rows)})")
         table.add_column("#", width=3)
         table.add_column("Name", style="cyan")
+        table.add_column("Kind", style="dim")
         table.add_column("Status")
-        for i, m in enumerate(DEFAULT_MCPS):
-            status = "[red]disabled[/red]" if m in disabled else "[green]enabled[/green]"
-            table.add_row(str(i + 1), m, status)
+        table.add_column("Target", style="dim")
+        for i, m in enumerate(rows):
+            status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
+            target_val = m.get("command") or m.get("url") or m.get("builtin_name") or ""
+            if isinstance(target_val, list):
+                target_val = " ".join(target_val)
+            table.add_row(str(i + 1), m.get("name", ""), m.get("kind", ""), status, str(target_val))
         console.print(table)
 
-        if custom:
-            ctable = Table(title=f"Custom MCPs ({len(custom)})")
-            ctable.add_column("#", width=3)
-            ctable.add_column("Name", style="cyan")
-            ctable.add_column("Command/URL", style="dim")
-            for i, m in enumerate(custom):
-                key = m.get("command") or m.get("url", "")
-                ctable.add_row(str(i + 1), m.get("name", ""), key)
-            console.print(ctable)
-
-        console.print("[cyan]t<#>[/cyan] toggle default, [cyan]a[/cyan]dd custom, [cyan]r<#>[/cyan] remove custom, [cyan]q[/cyan]uit")
+        console.print(
+            "[cyan]t<#>[/cyan] toggle, [cyan]a[/cyan]dd builtin, [cyan]c[/cyan]ustom, "
+            "[cyan]r<#>[/cyan] remove, [cyan]q[/cyan]uit"
+        )
         action = Prompt.ask("Action", default="q").strip().lower()
         if action in ("q", ""):
             return
 
         if action.startswith("t") and action[1:].isdigit():
             idx = int(action[1:]) - 1
-            if 0 <= idx < len(DEFAULT_MCPS):
-                name = DEFAULT_MCPS[idx]
-                if name in disabled:
-                    disabled.remove(name)
-                else:
-                    disabled.add(name)
-                await client.rest_patch("/api/config/mcp_disable", sorted(disabled))
-                console.print(f"[green]{name} {'disabled' if name in disabled else 'enabled'}. Restart required.[/green]")
+            if 0 <= idx < len(rows):
+                name = rows[idx].get("name")
+                enable = not rows[idx].get("enabled")
+                path = f"/api/mcps/{name}/{'enable' if enable else 'disable'}"
+                await client.rest_post(path, {})
+                console.print(f"[green]{name} {'enabled' if enable else 'disabled'}. Live on next message.[/green]")
 
         elif action == "a":
+            builtin = Prompt.ask("Builtin name (e.g. vault, shell, web-search)").strip()
+            if not builtin:
+                console.print("[red]builtin name is required[/red]")
+                continue
+            try:
+                await client.rest_post(
+                    "/api/mcps",
+                    {"name": builtin, "builtin_name": builtin, "enabled": True},
+                )
+                console.print("[green]Added. Live on next message.[/green]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
+
+        elif action == "c":
             name = Prompt.ask("MCP name").strip()
-            cmd = Prompt.ask("Command (blank if URL)").strip()
+            cmd = Prompt.ask("Command (space-separated argv, blank if URL)").strip()
             url = Prompt.ask("URL (blank if command)").strip() if not cmd else ""
             if not name or not (cmd or url):
                 console.print("[red]Name and (command or URL) required[/red]")
                 continue
-            entry = {"name": name}
+            entry: dict = {"name": name, "enabled": True}
             if cmd:
-                entry["command"] = cmd
+                entry["command"] = cmd.split()
             if url:
                 entry["url"] = url
-            custom.append(entry)
-            await client.rest_patch("/api/config/mcp", custom)
-            console.print("[green]Added. Restart required.[/green]")
+            try:
+                await client.rest_post("/api/mcps", entry)
+                console.print("[green]Added. Live on next message.[/green]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
 
         elif action.startswith("r") and action[1:].isdigit():
             idx = int(action[1:]) - 1
-            if 0 <= idx < len(custom):
-                if Confirm.ask(f"Remove '{custom[idx].get('name')}'?", default=False):
-                    del custom[idx]
-                    await client.rest_patch("/api/config/mcp", custom)
-                    console.print("[green]Removed. Restart required.[/green]")
+            if 0 <= idx < len(rows):
+                target = rows[idx].get("name")
+                if Confirm.ask(f"Remove {target!r}?", default=False):
+                    try:
+                        await client.rest_delete(f"/api/mcps/{target}")
+                        console.print("[green]Removed.[/green]")
+                    except Exception as e:
+                        console.print(f"[red]{e}[/red]")
 
 
 # ── Models ────────────────────────────────────────────────────────────────
 
 async def _models_menu(client: GatewayClient):
-    data = await client.rest_get("/api/models")
-    providers = data.get("models", {}) or {}
-    active = data.get("active", {}) or {}
+    """Model catalog editor — DB-backed + provider-discovery add flow.
 
-    table = Table(title="Configured Providers")
-    table.add_column("Provider", style="cyan")
-    table.add_column("API Key")
-    table.add_column("Base URL", style="dim")
-    table.add_column("Models", max_width=40)
-    for name, info in providers.items():
-        models = info.get("models", []) or []
-        models_str = ", ".join(models[:5]) + ("..." if len(models) > 5 else "")
-        table.add_row(
-            name,
-            info.get("api_key_display", ""),
-            info.get("base_url", "") or "",
-            models_str,
-        )
-    console.print(table)
+    Reads the ``models`` table via /api/models/db. Adds pull the dynamic
+    per-provider list from /api/models/available?provider=X (driven by
+    the user's configured API keys), so you only see models you can
+    actually use. Writes trigger a router rebuild on the next message.
+    """
+    while True:
+        db_models = (await client.rest_get("/api/models/db")).get("models", []) or []
+        active = (await client.rest_get("/api/models/active")).get("active", {}) or {}
 
-    if active:
-        console.print(f"\n[bold]Active model:[/bold] [cyan]{active.get('provider', '')}[/cyan] / "
-                      f"[cyan]{active.get('model_id', '')}[/cyan]")
-
-    console.print("\n[cyan]s[/cyan]witch active, [cyan]c[/cyan]atalog, [cyan]q[/cyan]uit")
-    action = Prompt.ask("Action", choices=["s", "c", "q"], default="q")
-    if action == "q":
-        return
-
-    if action == "c":
-        cat = await client.rest_get("/api/models/catalog")
-        models = cat.get("models", [])
-        ctable = Table(title=f"Model Catalog ({len(models)})")
-        ctable.add_column("Provider", style="cyan")
-        ctable.add_column("Model")
-        ctable.add_column("In $/M", justify="right")
-        ctable.add_column("Out $/M", justify="right")
-        for m in models:
-            ctable.add_row(
+        table = Table(title=f"Configured Models ({len(db_models)})")
+        table.add_column("#", width=3)
+        table.add_column("Runtime ID", style="cyan")
+        table.add_column("Provider", style="dim")
+        table.add_column("Status")
+        table.add_column("In $/M", justify="right")
+        table.add_column("Out $/M", justify="right")
+        for i, m in enumerate(db_models):
+            status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
+            table.add_row(
+                str(i + 1),
+                str(m.get("runtime_id", "")),
                 str(m.get("provider", "")),
-                str(m.get("model_id", "")),
-                f"{m.get('input_cost_per_million', '')}",
-                f"{m.get('output_cost_per_million', '')}",
+                status,
+                f"{m.get('input_cost_per_million') or '-'}",
+                f"{m.get('output_cost_per_million') or '-'}",
             )
-        console.print(ctable)
+        console.print(table)
 
-    elif action == "s":
-        provider = Prompt.ask("Provider name").strip()
-        model_id = Prompt.ask("Model ID").strip()
-        if not provider or not model_id:
+        if active:
+            console.print(
+                f"\n[bold]Active model:[/bold] [cyan]{active.get('provider', '')}[/cyan] / "
+                f"[cyan]{active.get('model_id', '')}[/cyan]"
+            )
+
+        console.print(
+            "\n[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] toggle, [cyan]r<#>[/cyan] remove, "
+            "[cyan]s[/cyan]witch active, [cyan]q[/cyan]uit"
+        )
+        action = Prompt.ask("Action", default="q").strip().lower()
+        if action in ("q", ""):
             return
-        await client.rest_put("/api/models/active", {"provider": provider, "model_id": model_id})
-        console.print(f"[green]Active model set to {provider}/{model_id}.[/green]")
+
+        if action == "a":
+            provider = Prompt.ask("Provider (e.g. openai, anthropic, google, claude-cli)").strip()
+            if not provider:
+                continue
+            try:
+                avail = (await client.rest_get(f"/api/models/available?provider={provider}")).get("models", []) or []
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
+                continue
+            if not avail:
+                console.print(f"[yellow]No models available for {provider}.[/yellow]")
+                continue
+            atable = Table(title=f"Available from {provider}")
+            atable.add_column("#", width=3)
+            atable.add_column("Model", style="cyan")
+            atable.add_column("Display", style="dim")
+            atable.add_column("Added?")
+            for i, m in enumerate(avail):
+                atable.add_row(
+                    str(i + 1),
+                    str(m.get("id", "")),
+                    str(m.get("display_name", "")),
+                    "[green]yes[/green]" if m.get("added") else "",
+                )
+            console.print(atable)
+            pick = Prompt.ask("Pick # (or q to cancel)", default="q").strip().lower()
+            if pick == "q" or not pick.isdigit():
+                continue
+            idx = int(pick) - 1
+            if not (0 <= idx < len(avail)):
+                continue
+            picked = avail[idx]
+            try:
+                await client.rest_post(
+                    "/api/models/db",
+                    {"provider": provider, "model_id": picked.get("id"), "display_name": picked.get("display_name")},
+                )
+                console.print("[green]Added. Live on next message.[/green]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
+
+        elif action.startswith("t") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(db_models):
+                m = db_models[idx]
+                path = f"/api/models/db/{m['runtime_id']}/{'disable' if m.get('enabled') else 'enable'}"
+                try:
+                    await client.rest_post(path, {})
+                    console.print("[green]Toggled. Live on next message.[/green]")
+                except Exception as e:
+                    console.print(f"[red]{e}[/red]")
+
+        elif action.startswith("r") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(db_models):
+                m = db_models[idx]
+                if Confirm.ask(f"Remove {m['runtime_id']!r}?", default=False):
+                    try:
+                        await client.rest_delete(f"/api/models/db/{m['runtime_id']}")
+                        console.print("[green]Removed.[/green]")
+                    except Exception as e:
+                        console.print(f"[red]{e}[/red]")
+
+        elif action == "s":
+            provider = Prompt.ask("Provider name").strip()
+            model_id = Prompt.ask("Model ID").strip()
+            if not provider or not model_id:
+                continue
+            await client.rest_put("/api/models/active", {"provider": provider, "model_id": model_id})
+            console.print(f"[green]Active model set to {provider}/{model_id}.[/green]")
 
 
 # ── Providers ─────────────────────────────────────────────────────────────
