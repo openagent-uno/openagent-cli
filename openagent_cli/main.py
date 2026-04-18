@@ -703,51 +703,54 @@ async def _models_menu(client: GatewayClient):
     """Model catalog editor — DB-backed + provider-discovery add flow.
 
     Reads the ``models`` table via /api/models/db. Adds pull the dynamic
-    per-provider list from /api/models/available?provider=X (driven by
-    the user's configured API keys), so you only see models you can
-    actually use. Writes trigger a router rebuild on the next message.
+    per-provider list from /api/models/available?provider=X (live fetch
+    from the provider's own API when a key is configured, OpenRouter's
+    public catalog otherwise). Writes trigger a router rebuild on the
+    next message. Pricing for claude-cli rows shows as ``sub`` (Pro/Max
+    subscription, no per-token billing).
     """
     while True:
         db_models = (await client.rest_get("/api/models/db")).get("models", []) or []
-        active = (await client.rest_get("/api/models/active")).get("active", {}) or {}
 
         table = Table(title=f"Configured Models ({len(db_models)})")
         table.add_column("#", width=3)
-        table.add_column("Runtime ID", style="cyan")
+        table.add_column("Framework", style="dim")
         table.add_column("Provider", style="dim")
+        table.add_column("Model", style="cyan")
         table.add_column("Status")
-        table.add_column("In $/M", justify="right")
-        table.add_column("Out $/M", justify="right")
+        table.add_column("Cost (in/out $/M)", justify="right")
         for i, m in enumerate(db_models):
             status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
+            fw = str(m.get("framework", "agno"))
+            if fw == "claude-cli":
+                cost = "[dim]sub[/dim]"
+            else:
+                in_c = m.get("input_cost_per_million")
+                out_c = m.get("output_cost_per_million")
+                cost = f"{in_c or '-'} / {out_c or '-'}"
             table.add_row(
-                str(i + 1),
-                str(m.get("runtime_id", "")),
-                str(m.get("provider", "")),
-                status,
-                f"{m.get('input_cost_per_million') or '-'}",
-                f"{m.get('output_cost_per_million') or '-'}",
+                str(i + 1), fw, str(m.get("provider", "")),
+                str(m.get("model_id", "")), status, cost,
             )
         console.print(table)
 
-        if active:
-            console.print(
-                f"\n[bold]Active model:[/bold] [cyan]{active.get('provider', '')}[/cyan] / "
-                f"[cyan]{active.get('model_id', '')}[/cyan]"
-            )
-
         console.print(
             "\n[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] toggle, [cyan]r<#>[/cyan] remove, "
-            "[cyan]s[/cyan]witch active, [cyan]q[/cyan]uit"
+            "[cyan]p<#>[/cyan] pin to session, [cyan]u[/cyan]npin session, [cyan]q[/cyan]uit"
         )
         action = Prompt.ask("Action", default="q").strip().lower()
         if action in ("q", ""):
             return
 
         if action == "a":
-            provider = Prompt.ask("Provider (e.g. openai, anthropic, google, claude-cli)").strip()
+            provider = Prompt.ask("Provider (e.g. openai, anthropic, google, zai)").strip()
             if not provider:
                 continue
+            framework = Prompt.ask(
+                "Framework",
+                choices=["agno", "claude-cli"],
+                default="claude-cli" if provider == "anthropic" else "agno",
+            )
             try:
                 avail = (await client.rest_get(f"/api/models/available?provider={provider}")).get("models", []) or []
             except Exception as e:
@@ -763,8 +766,7 @@ async def _models_menu(client: GatewayClient):
             atable.add_column("Added?")
             for i, m in enumerate(avail):
                 atable.add_row(
-                    str(i + 1),
-                    str(m.get("id", "")),
+                    str(i + 1), str(m.get("id", "")),
                     str(m.get("display_name", "")),
                     "[green]yes[/green]" if m.get("added") else "",
                 )
@@ -779,7 +781,11 @@ async def _models_menu(client: GatewayClient):
             try:
                 await client.rest_post(
                     "/api/models/db",
-                    {"provider": provider, "model_id": picked.get("id"), "display_name": picked.get("display_name")},
+                    {
+                        "provider": provider, "model_id": picked.get("id"),
+                        "framework": framework,
+                        "display_name": picked.get("display_name"),
+                    },
                 )
                 console.print("[green]Added. Live on next message.[/green]")
             except Exception as e:
@@ -807,13 +813,33 @@ async def _models_menu(client: GatewayClient):
                     except Exception as e:
                         console.print(f"[red]{e}[/red]")
 
-        elif action == "s":
-            provider = Prompt.ask("Provider name").strip()
-            model_id = Prompt.ask("Model ID").strip()
-            if not provider or not model_id:
+        elif action.startswith("p") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if not (0 <= idx < len(db_models)):
                 continue
-            await client.rest_put("/api/models/active", {"provider": provider, "model_id": model_id})
-            console.print(f"[green]Active model set to {provider}/{model_id}.[/green]")
+            session = Prompt.ask("Session ID (blank for current active session)").strip()
+            if not session:
+                console.print("[yellow]Session ID required (run /sessions to list).[/yellow]")
+                continue
+            m = db_models[idx]
+            try:
+                await client.rest_put(
+                    f"/api/sessions/{session}/model",
+                    {"runtime_id": m["runtime_id"]},
+                )
+                console.print(f"[green]Pinned {session} → {m['runtime_id']}.[/green]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red] [dim](cross-framework pins are rejected — unpin first)[/dim]")
+
+        elif action == "u":
+            session = Prompt.ask("Session ID to unpin").strip()
+            if not session:
+                continue
+            try:
+                await client.rest_delete(f"/api/sessions/{session}/model")
+                console.print(f"[green]Unpinned {session}.[/green]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
 
 
 # ── Providers ─────────────────────────────────────────────────────────────
