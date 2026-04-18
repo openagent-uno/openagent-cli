@@ -423,8 +423,8 @@ async def _config_menu(client: GatewayClient):
     table.add_row("name", str(cfg.get("name", "")))
     table.add_row("model.permission_mode", str(cfg.get("model", {}).get("permission_mode", "bypass")))
     table.add_row("classifier_model", str(cfg.get("model", {}).get("classifier_model", "auto")))
-    # MCPs and models live in SQLite since v0.9.0 — use /mcps and /models
-    # to inspect and edit them.
+    # Providers, MCPs, and models live in SQLite — use /mcps and /models
+    # (and ``openagent provider``) to inspect and edit them.
     channels = cfg.get("channels", {})
     table.add_row("channels", ", ".join(channels.keys()) if channels else "none")
     table.add_row("dream_mode", str(cfg.get("dream_mode", {}).get("enabled", False)))
