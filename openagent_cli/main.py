@@ -421,10 +421,10 @@ async def _config_menu(client: GatewayClient):
     table.add_column("Key", style="cyan")
     table.add_column("Value")
     table.add_row("name", str(cfg.get("name", "")))
-    table.add_row("model.provider", str(cfg.get("model", {}).get("provider", "")))
-    table.add_row("model.model_id", str(cfg.get("model", {}).get("model_id", "")))
-    table.add_row("mcp_defaults", str(cfg.get("mcp_defaults", True)))
-    table.add_row("custom MCPs", str(len(cfg.get("mcp", []))))
+    table.add_row("model.permission_mode", str(cfg.get("model", {}).get("permission_mode", "bypass")))
+    table.add_row("classifier_model", str(cfg.get("model", {}).get("classifier_model", "auto")))
+    # MCPs and models live in SQLite since v0.9.0 — use /mcps and /models
+    # to inspect and edit them.
     channels = cfg.get("channels", {})
     table.add_row("channels", ", ".join(channels.keys()) if channels else "none")
     table.add_row("dream_mode", str(cfg.get("dream_mode", {}).get("enabled", False)))
