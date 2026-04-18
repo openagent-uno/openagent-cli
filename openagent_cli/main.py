@@ -867,16 +867,16 @@ async def _providers_menu(client: GatewayClient):
 
         if action == "a":
             name = Prompt.ask("Provider name").strip()
-            api_key = Prompt.ask("API key (blank for env var)").strip()
+            api_key = Prompt.ask("API key").strip()
             base_url = Prompt.ask("Base URL (optional)").strip()
             payload = {"name": name}
             if api_key:
                 payload["api_key"] = api_key
             if base_url:
                 payload["base_url"] = base_url
-            res = await client.rest_post("/api/models", payload)
+            res = await client.rest_post("/api/providers", payload)
             if res.get("ok"):
-                console.print("[green]Added.[/green]")
+                console.print("[green]Added. Live on next message.[/green]")
             else:
                 console.print(f"[red]Failed: {res}[/red]")
 
@@ -885,7 +885,7 @@ async def _providers_menu(client: GatewayClient):
             if 0 <= idx < len(names):
                 name = names[idx]
                 console.print(f"[dim]Testing {name}...[/dim]")
-                res = await client.rest_post(f"/api/models/{name}/test", {})
+                res = await client.rest_post(f"/api/providers/{name}/test", {})
                 if res.get("ok"):
                     console.print(f"[green]✓ {res.get('model', '?')}: {res.get('response', '')[:80]}[/green]")
                 else:
@@ -895,10 +895,11 @@ async def _providers_menu(client: GatewayClient):
             idx = int(action[1:]) - 1
             if 0 <= idx < len(names):
                 name = names[idx]
-                if Confirm.ask(f"Remove provider '{name}'?", default=False):
-                    res = await client.rest_delete(f"/api/models/{name}")
+                if Confirm.ask(f"Remove provider {name!r} (cascade-deletes its models)?", default=False):
+                    res = await client.rest_delete(f"/api/providers/{name}")
                     if res.get("ok"):
-                        console.print("[green]Removed.[/green]")
+                        purged = res.get("models_purged", 0)
+                        console.print(f"[green]Removed ({purged} model(s) purged).[/green]")
                     else:
                         console.print(f"[red]Failed: {res}[/red]")
 
