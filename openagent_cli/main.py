@@ -422,10 +422,9 @@ async def _config_menu(client: GatewayClient):
     table.add_column("Key", style="cyan")
     table.add_column("Value")
     table.add_row("name", str(cfg.get("name", "")))
-    table.add_row("model.permission_mode", str(cfg.get("model", {}).get("permission_mode", "bypass")))
-    table.add_row("classifier_model", str(cfg.get("model", {}).get("classifier_model", "auto")))
-    # Providers, MCPs, and models live in SQLite — use /mcps and /models
-    # (and ``openagent provider``) to inspect and edit them.
+    # Providers, MCPs, models, and scheduled tasks all live in SQLite —
+    # use /mcps, /models, /tasks (and ``openagent provider``) to inspect
+    # and edit them.
     channels = cfg.get("channels", {})
     table.add_row("channels", ", ".join(channels.keys()) if channels else "none")
     table.add_row("dream_mode", str(cfg.get("dream_mode", {}).get("enabled", False)))
@@ -553,20 +552,31 @@ async def _channels_submenu(client: GatewayClient, cfg: dict):
 # ── Tasks (cron) ─────────────────────────────────────────────────────────
 
 async def _tasks_menu(client: GatewayClient):
-    while True:
-        cfg = await client.rest_get("/api/config")
-        sched = cfg.get("scheduler", {}) or {}
-        tasks = sched.get("tasks", []) or []
+    """Scheduled tasks — DB-backed via ``/api/scheduled-tasks``.
 
-        table = Table(title=f"Scheduled Tasks ({len(tasks)})  enabled={sched.get('enabled', False)}")
+    Changes take effect within the scheduler's next tick (~30 s). No
+    restart needed.
+    """
+    while True:
+        data = await client.rest_get("/api/scheduled-tasks")
+        tasks = data.get("tasks", []) or []
+
+        table = Table(title=f"Scheduled Tasks ({len(tasks)})")
         table.add_column("#", width=3)
         table.add_column("Name", style="cyan")
         table.add_column("Cron")
+        table.add_column("On", width=3)
         table.add_column("Prompt", max_width=50)
         for i, t in enumerate(tasks):
-            table.add_row(str(i + 1), t.get("name", "?"), t.get("cron", "?"), (t.get("prompt", ""))[:50])
+            table.add_row(
+                str(i + 1),
+                t.get("name", "?"),
+                t.get("cron_expression", "?"),
+                "✓" if t.get("enabled") else "—",
+                (t.get("prompt", ""))[:50],
+            )
         console.print(table)
-        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle scheduler, [cyan]q[/cyan]uit")
+        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle #, [cyan]q[/cyan]uit")
         action = Prompt.ask("Action", default="q")
         action = action.strip().lower()
 
@@ -580,32 +590,52 @@ async def _tasks_menu(client: GatewayClient):
             if not (name and cron and prompt):
                 console.print("[red]All fields required[/red]")
                 continue
-            tasks.append({"name": name, "cron": cron, "prompt": prompt})
-            await client.rest_patch("/api/config/scheduler", {"enabled": sched.get("enabled", True), "tasks": tasks})
-            console.print("[green]Added. Restart required.[/green]")
+            res = await client.rest_post(
+                "/api/scheduled-tasks",
+                {"name": name, "cron_expression": cron, "prompt": prompt},
+            )
+            if res.get("error"):
+                console.print(f"[red]{res['error']}[/red]")
+            else:
+                console.print("[green]Added.[/green]")
 
         elif action.startswith("e") and action[1:].isdigit():
             idx = int(action[1:]) - 1
             if 0 <= idx < len(tasks):
                 t = tasks[idx]
-                t["name"] = Prompt.ask("Name", default=t.get("name", ""))
-                t["cron"] = Prompt.ask("Cron", default=t.get("cron", ""))
-                t["prompt"] = Prompt.ask("Prompt", default=t.get("prompt", ""))
-                await client.rest_patch("/api/config/scheduler", {"enabled": sched.get("enabled", True), "tasks": tasks})
-                console.print("[green]Saved. Restart required.[/green]")
+                name = Prompt.ask("Name", default=t.get("name", ""))
+                cron = Prompt.ask("Cron", default=t.get("cron_expression", ""))
+                prompt = Prompt.ask("Prompt", default=t.get("prompt", ""))
+                res = await client.rest_patch(
+                    f"/api/scheduled-tasks/{t['id']}",
+                    {"name": name, "cron_expression": cron, "prompt": prompt},
+                )
+                if res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    console.print("[green]Saved.[/green]")
 
         elif action.startswith("d") and action[1:].isdigit():
             idx = int(action[1:]) - 1
             if 0 <= idx < len(tasks):
-                if Confirm.ask(f"Delete '{tasks[idx].get('name')}'?", default=False):
-                    del tasks[idx]
-                    await client.rest_patch("/api/config/scheduler", {"enabled": sched.get("enabled", True), "tasks": tasks})
-                    console.print("[green]Deleted. Restart required.[/green]")
+                t = tasks[idx]
+                if Confirm.ask(f"Delete '{t.get('name')}'?", default=False):
+                    res = await client.rest_delete(f"/api/scheduled-tasks/{t['id']}")
+                    if res.get("error"):
+                        console.print(f"[red]{res['error']}[/red]")
+                    else:
+                        console.print("[green]Deleted.[/green]")
 
-        elif action == "t":
-            new_enabled = not sched.get("enabled", False)
-            await client.rest_patch("/api/config/scheduler", {"enabled": new_enabled, "tasks": tasks})
-            console.print(f"[green]Scheduler {'enabled' if new_enabled else 'disabled'}. Restart required.[/green]")
+        elif action.startswith("t") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(tasks):
+                t = tasks[idx]
+                res = await client.rest_patch(
+                    f"/api/scheduled-tasks/{t['id']}",
+                    {"enabled": not t.get("enabled")},
+                )
+                if res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
 
 
 # ── MCPs ─────────────────────────────────────────────────────────────────
