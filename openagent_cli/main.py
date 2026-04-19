@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -702,18 +703,18 @@ async def _mcps_menu(client: GatewayClient):
 async def _models_menu(client: GatewayClient):
     """Model catalog editor — DB-backed + provider-discovery add flow.
 
-    Reads the ``models`` table via /api/models/db. Adds pull the dynamic
-    per-provider list from /api/models/available?provider=X (live fetch
-    from the provider's own API when a key is configured, OpenRouter's
-    public catalog otherwise). Writes trigger a router rebuild on the
-    next message. Pricing for claude-cli rows shows as ``sub`` (Pro/Max
+    Reads the ``models`` table via /api/models. Each row is shown with
+    its surrogate id so toggle/remove operations map unambiguously to
+    the DB even when the same vendor is registered under both
+    frameworks. Pricing for claude-cli rows shows as ``sub`` (Pro/Max
     subscription, no per-token billing).
     """
     while True:
-        db_models = (await client.rest_get("/api/models/db")).get("models", []) or []
+        db_models = (await client.rest_get("/api/models")).get("models", []) or []
 
         table = Table(title=f"Configured Models ({len(db_models)})")
         table.add_column("#", width=3)
+        table.add_column("id", width=4, style="dim")
         table.add_column("Framework", style="dim")
         table.add_column("Provider", style="dim")
         table.add_column("Model", style="cyan")
@@ -729,8 +730,9 @@ async def _models_menu(client: GatewayClient):
                 out_c = m.get("output_cost_per_million")
                 cost = f"{in_c or '-'} / {out_c or '-'}"
             table.add_row(
-                str(i + 1), fw, str(m.get("provider", "")),
-                str(m.get("model_id", "")), status, cost,
+                str(i + 1), str(m.get("id", "")), fw,
+                str(m.get("provider_name", "")),
+                str(m.get("model", "")), status, cost,
             )
         console.print(table)
 
@@ -743,23 +745,41 @@ async def _models_menu(client: GatewayClient):
             return
 
         if action == "a":
-            provider = Prompt.ask("Provider (e.g. openai, anthropic, google, zai)").strip()
-            if not provider:
+            # Pick a provider row by id (unambiguous when the same
+            # vendor is registered under both frameworks).
+            provs = (await client.rest_get("/api/providers")).get("providers", []) or []
+            if not provs:
+                console.print("[yellow]No providers configured. Add one via /providers first.[/yellow]")
                 continue
-            framework = Prompt.ask(
-                "Framework",
-                choices=["agno", "claude-cli"],
-                default="claude-cli" if provider == "anthropic" else "agno",
-            )
+            ptable = Table(title="Providers")
+            ptable.add_column("#", width=3)
+            ptable.add_column("id", width=4, style="dim")
+            ptable.add_column("Name", style="cyan")
+            ptable.add_column("Framework", style="dim")
+            for i, p in enumerate(provs):
+                ptable.add_row(
+                    str(i + 1), str(p.get("id", "")),
+                    p.get("name", ""), p.get("framework", ""),
+                )
+            console.print(ptable)
+            pick = Prompt.ask("Pick provider # (or q to cancel)", default="q").strip().lower()
+            if pick == "q" or not pick.isdigit():
+                continue
+            p_idx = int(pick) - 1
+            if not (0 <= p_idx < len(provs)):
+                continue
+            provider_row = provs[p_idx]
             try:
-                avail = (await client.rest_get(f"/api/models/available?provider={provider}")).get("models", []) or []
+                avail = (await client.rest_get(
+                    f"/api/models/available?provider_id={provider_row['id']}"
+                )).get("models", []) or []
             except Exception as e:
                 console.print(f"[red]{e}[/red]")
                 continue
             if not avail:
-                console.print(f"[yellow]No models available for {provider}.[/yellow]")
+                console.print(f"[yellow]No models available from {provider_row['name']}.[/yellow]")
                 continue
-            atable = Table(title=f"Available from {provider}")
+            atable = Table(title=f"Available from {provider_row['name']} ({provider_row['framework']})")
             atable.add_column("#", width=3)
             atable.add_column("Model", style="cyan")
             atable.add_column("Display", style="dim")
@@ -771,7 +791,7 @@ async def _models_menu(client: GatewayClient):
                     "[green]yes[/green]" if m.get("added") else "",
                 )
             console.print(atable)
-            pick = Prompt.ask("Pick # (or q to cancel)", default="q").strip().lower()
+            pick = Prompt.ask("Pick model # (or q to cancel)", default="q").strip().lower()
             if pick == "q" or not pick.isdigit():
                 continue
             idx = int(pick) - 1
@@ -780,10 +800,10 @@ async def _models_menu(client: GatewayClient):
             picked = avail[idx]
             try:
                 await client.rest_post(
-                    "/api/models/db",
+                    "/api/models",
                     {
-                        "provider": provider, "model_id": picked.get("id"),
-                        "framework": framework,
+                        "provider_id": provider_row["id"],
+                        "model": picked.get("id"),
                         "display_name": picked.get("display_name"),
                     },
                 )
@@ -795,7 +815,7 @@ async def _models_menu(client: GatewayClient):
             idx = int(action[1:]) - 1
             if 0 <= idx < len(db_models):
                 m = db_models[idx]
-                path = f"/api/models/db/{m['runtime_id']}/{'disable' if m.get('enabled') else 'enable'}"
+                path = f"/api/models/{m['id']}/{'disable' if m.get('enabled') else 'enable'}"
                 try:
                     await client.rest_post(path, {})
                     console.print("[green]Toggled. Live on next message.[/green]")
@@ -808,7 +828,7 @@ async def _models_menu(client: GatewayClient):
                 m = db_models[idx]
                 if Confirm.ask(f"Remove {m['runtime_id']!r}?", default=False):
                     try:
-                        await client.rest_delete(f"/api/models/db/{m['runtime_id']}")
+                        await client.rest_delete(f"/api/models/{m['id']}")
                         console.print("[green]Removed.[/green]")
                     except Exception as e:
                         console.print(f"[red]{e}[/red]")
@@ -847,17 +867,24 @@ async def _models_menu(client: GatewayClient):
 async def _providers_menu(client: GatewayClient):
     while True:
         data = await client.rest_get("/api/providers")
-        providers = data.get("providers", {}) or {}
+        provs = data.get("providers", []) or []
 
-        table = Table(title=f"Providers ({len(providers)})")
+        table = Table(title=f"Providers ({len(provs)})")
         table.add_column("#", width=3)
+        table.add_column("id", width=4, style="dim")
         table.add_column("Name", style="cyan")
+        table.add_column("Framework", style="dim")
         table.add_column("API Key")
         table.add_column("Base URL", style="dim")
-        names = list(providers.keys())
-        for i, name in enumerate(names):
-            info = providers[name]
-            table.add_row(str(i + 1), name, info.get("api_key_display", ""), info.get("base_url", "") or "")
+        for i, info in enumerate(provs):
+            table.add_row(
+                str(i + 1),
+                str(info.get("id", "")),
+                info.get("name", ""),
+                info.get("framework", ""),
+                info.get("api_key_display", ""),
+                info.get("base_url", "") or "",
+            )
         console.print(table)
 
         console.print("[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] test, [cyan]r<#>[/cyan] remove, [cyan]q[/cyan]uit")
@@ -866,26 +893,36 @@ async def _providers_menu(client: GatewayClient):
             return
 
         if action == "a":
-            name = Prompt.ask("Provider name").strip()
-            api_key = Prompt.ask("API key").strip()
+            name = Prompt.ask("Provider name (e.g. openai, anthropic, zai)").strip()
+            framework = Prompt.ask(
+                "Framework",
+                choices=["agno", "claude-cli"],
+                default="claude-cli" if name == "anthropic" else "agno",
+            )
+            api_key = ""
+            if framework == "agno":
+                api_key = Prompt.ask("API key").strip()
             base_url = Prompt.ask("Base URL (optional)").strip()
-            payload = {"name": name}
+            payload: dict[str, Any] = {"name": name, "framework": framework}
             if api_key:
                 payload["api_key"] = api_key
             if base_url:
                 payload["base_url"] = base_url
-            res = await client.rest_post("/api/providers", payload)
-            if res.get("ok"):
-                console.print("[green]Added. Live on next message.[/green]")
-            else:
-                console.print(f"[red]Failed: {res}[/red]")
+            try:
+                res = await client.rest_post("/api/providers", payload)
+                if res.get("ok"):
+                    console.print("[green]Added. Live on next message.[/green]")
+                else:
+                    console.print(f"[red]Failed: {res}[/red]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
 
         elif action.startswith("t") and action[1:].isdigit():
             idx = int(action[1:]) - 1
-            if 0 <= idx < len(names):
-                name = names[idx]
-                console.print(f"[dim]Testing {name}...[/dim]")
-                res = await client.rest_post(f"/api/providers/{name}/test", {})
+            if 0 <= idx < len(provs):
+                prov = provs[idx]
+                console.print(f"[dim]Testing {prov.get('name')} ({prov.get('framework')})...[/dim]")
+                res = await client.rest_post(f"/api/providers/{prov['id']}/test", {})
                 if res.get("ok"):
                     console.print(f"[green]✓ {res.get('model', '?')}: {res.get('response', '')[:80]}[/green]")
                 else:
@@ -893,10 +930,11 @@ async def _providers_menu(client: GatewayClient):
 
         elif action.startswith("r") and action[1:].isdigit():
             idx = int(action[1:]) - 1
-            if 0 <= idx < len(names):
-                name = names[idx]
-                if Confirm.ask(f"Remove provider {name!r} (cascade-deletes its models)?", default=False):
-                    res = await client.rest_delete(f"/api/providers/{name}")
+            if 0 <= idx < len(provs):
+                prov = provs[idx]
+                label = f"{prov.get('name')} ({prov.get('framework')})"
+                if Confirm.ask(f"Remove provider {label} (cascade-deletes its models)?", default=False):
+                    res = await client.rest_delete(f"/api/providers/{prov['id']}")
                     if res.get("ok"):
                         purged = res.get("models_purged", 0)
                         console.print(f"[green]Removed ({purged} model(s) purged).[/green]")
