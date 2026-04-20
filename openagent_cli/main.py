@@ -749,9 +749,11 @@ async def _models_menu(client: GatewayClient):
         table.add_column("Provider", style="dim")
         table.add_column("Model", style="cyan")
         table.add_column("Status")
+        table.add_column("Router")
         table.add_column("Cost (in/out $/M)", justify="right")
         for i, m in enumerate(db_models):
             status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
+            router = "[magenta]yes[/magenta]" if m.get("is_classifier") else ""
             fw = str(m.get("framework", "agno"))
             if fw == "claude-cli":
                 cost = "[dim]sub[/dim]"
@@ -762,13 +764,14 @@ async def _models_menu(client: GatewayClient):
             table.add_row(
                 str(i + 1), str(m.get("id", "")), fw,
                 str(m.get("provider_name", "")),
-                str(m.get("model", "")), status, cost,
+                str(m.get("model", "")), status, router, cost,
             )
         console.print(table)
 
         console.print(
-            "\n[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] toggle, [cyan]r<#>[/cyan] remove, "
-            "[cyan]p<#>[/cyan] pin to session, [cyan]u[/cyan]npin session, [cyan]q[/cyan]uit"
+            "\n[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] toggle, [cyan]c<#>[/cyan] set as router/classifier, "
+            "[cyan]r<#>[/cyan] remove, [cyan]p<#>[/cyan] pin to session, "
+            "[cyan]u[/cyan]npin session, [cyan]q[/cyan]uit"
         )
         action = Prompt.ask("Action", default="q").strip().lower()
         if action in ("q", ""):
@@ -849,6 +852,26 @@ async def _models_menu(client: GatewayClient):
                 try:
                     await client.rest_post(path, {})
                     console.print("[green]Toggled. Live on next message.[/green]")
+                except Exception as e:
+                    console.print(f"[red]{e}[/red]")
+
+        elif action.startswith("c") and action[1:].isdigit():
+            # Toggle the is_classifier flag on this row only. Multiple
+            # rows may carry the flag — the router picks the first
+            # flagged entry in catalog order each turn, so flagged
+            # rows form a "classifier pool". PUT /api/models/{id} is
+            # a narrow update that never touches other rows.
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(db_models):
+                m = db_models[idx]
+                new_flag = not bool(m.get("is_classifier"))
+                try:
+                    await client.rest_put(
+                        f"/api/models/{m['id']}",
+                        {"is_classifier": new_flag},
+                    )
+                    label = "set as router" if new_flag else "cleared router flag"
+                    console.print(f"[green]{label}. Live on next message.[/green]")
                 except Exception as e:
                     console.print(f"[red]{e}[/red]")
 
