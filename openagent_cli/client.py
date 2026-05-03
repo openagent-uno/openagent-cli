@@ -5,9 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Callable, Awaitable
+from typing import Callable
 
 import aiohttp
+
+from openagent.gateway import protocol as P
+from openagent.stream.collector import StreamCollector, fold_outbound_event
+from openagent.stream.events import (
+    AudioChunk, Interrupt, SessionClose, SessionOpen, TextFinal, now_ms,
+)
+from openagent.stream.wire import event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +27,15 @@ class GatewayClient:
         self.token = token
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._session: aiohttp.ClientSession | None = None
-        self._pending: dict[str, asyncio.Future] = {}
+        # ``_stream_pending``: in-flight collectors keyed by session_id;
+        # the listener folds outbound events into them via
+        # ``fold_outbound_event`` and ``send_message`` awaits ``done``.
+        # ``_opened_sessions``: sessions already ``session_open``'d on
+        # this WS — cleared on disconnect since the gateway tears down
+        # server-side ``StreamSession``s when the WS drops.
+        self._stream_pending: dict[str, StreamCollector] = {}
+        self._command_future: asyncio.Future | None = None
+        self._opened_sessions: set[str] = set()
         self._status_cb: dict[str, Callable] = {}
         self._listener_task: asyncio.Task | None = None
         self.agent_name: str | None = None
@@ -33,10 +48,9 @@ class GatewayClient:
     async def connect(self) -> None:
         self._session = aiohttp.ClientSession()
         self._ws = await self._session.ws_connect(self.url)
-        # Auth
-        await self._ws.send_json({"type": "auth", "token": self.token or "", "client_id": "cli"})
+        await self._ws.send_json({"type": P.AUTH, "token": self.token or "", "client_id": "cli"})
         resp = await self._ws.receive_json()
-        if resp.get("type") == "auth_error":
+        if resp.get("type") == P.AUTH_ERROR:
             raise ConnectionError(f"Auth failed: {resp.get('reason')}")
         self.agent_name = resp.get("agent_name")
         self.agent_version = resp.get("version")
@@ -49,6 +63,8 @@ class GatewayClient:
             await self._ws.close()
         if self._session:
             await self._session.close()
+        self._opened_sessions.clear()
+        self._stream_pending.clear()
 
     async def _listen(self) -> None:
         async for msg in self._ws:
@@ -57,30 +73,144 @@ class GatewayClient:
             data = json.loads(msg.data)
             t = data.get("type")
             sid = data.get("session_id")
-            if t == "status" and sid in self._status_cb:
-                await self._status_cb[sid](data.get("text", ""))
-            elif t == "response" and sid in self._pending:
-                self._pending.pop(sid).set_result(data)
-                self._status_cb.pop(sid, None)
-            elif t == "error" and sid in self._pending:
-                self._pending.pop(sid).set_result(data)
-            elif t == "command_result" and "__cmd__" in self._pending:
-                self._pending.pop("__cmd__").set_result(data)
+            collector = self._stream_pending.get(sid) if sid else None
 
-    async def send_message(self, text: str, session_id: str, on_status: Callable | None = None) -> dict:
-        fut = asyncio.get_event_loop().create_future()
-        self._pending[session_id] = fut
+            if t == P.STATUS:
+                cb = self._status_cb.get(sid)
+                if cb is not None:
+                    await cb(data.get("text", ""))
+                continue
+            if t == P.COMMAND_RESULT:
+                if self._command_future is not None and not self._command_future.done():
+                    self._command_future.set_result(data)
+                    self._command_future = None
+                continue
+            if t == P.ERROR and collector is None:
+                logger.warning("gateway error (no session): %s", data.get("text"))
+                continue
+
+            evt = wire_to_event(data)
+            if evt is None or collector is None:
+                continue
+            if fold_outbound_event(collector, evt):
+                collector.done.set()
+
+    async def send_message(
+        self,
+        text: str,
+        session_id: str,
+        on_status: Callable | None = None,
+        *,
+        source: str = "user_typed",
+    ) -> dict:
+        """Push a typed message into the user's stream session and await the reply.
+
+        Lazily opens a ``batched``-profile session on first call (with
+        ``speak=False`` since the CLI is text-only). Returns the legacy
+        answer-response dict shape: ``{type, text, model, attachments}``
+        or ``{type: "error", text}``.
+        """
+        if session_id not in self._opened_sessions:
+            await self._ws.send_json(event_to_wire(SessionOpen(
+                session_id=session_id,
+                ts_ms=now_ms(),
+                profile="batched",
+                client_kind="cli",
+                speak=False,
+            )))
+            self._opened_sessions.add(session_id)
+
+        collector = StreamCollector()
+        self._stream_pending[session_id] = collector
         if on_status:
             self._status_cb[session_id] = on_status
-        await self._ws.send_json({"type": "message", "text": text, "session_id": session_id})
-        return await fut
+
+        try:
+            await self._ws.send_json(event_to_wire(TextFinal(
+                session_id=session_id,
+                ts_ms=now_ms(),
+                text=text,
+                source=source,  # type: ignore[arg-type]
+            )))
+        except Exception:
+            self._stream_pending.pop(session_id, None)
+            self._status_cb.pop(session_id, None)
+            raise
+
+        try:
+            await collector.done.wait()
+        finally:
+            self._stream_pending.pop(session_id, None)
+            self._status_cb.pop(session_id, None)
+
+        return collector.to_legacy_reply()
 
     async def send_command(self, name: str) -> str:
-        fut = asyncio.get_event_loop().create_future()
-        self._pending["__cmd__"] = fut
-        await self._ws.send_json({"type": "command", "name": name})
-        result = await fut
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        self._command_future = fut
+        try:
+            await self._ws.send_json({"type": P.COMMAND, "name": name})
+            result = await fut
+        finally:
+            if self._command_future is fut:
+                self._command_future = None
         return result.get("text", "")
+
+    # ── Stream protocol helpers (opt-in) ────────────────────────────
+    # Used by scripted CLIs and integration tests that want the typed
+    # event vocabulary directly instead of the answer-response wrapper.
+
+    async def send_session_open(
+        self,
+        session_id: str,
+        *,
+        profile: str = "realtime",
+        language: str | None = None,
+        client_kind: str | None = "cli",
+    ) -> None:
+        await self._ws.send_json(event_to_wire(SessionOpen(
+            session_id=session_id, ts_ms=now_ms(),
+            profile=profile,  # type: ignore[arg-type]
+            language=language,
+            client_kind=client_kind,
+        )))
+
+    async def send_session_close(self, session_id: str) -> None:
+        await self._ws.send_json(event_to_wire(SessionClose(
+            session_id=session_id, ts_ms=now_ms(),
+        )))
+
+    async def send_text_final(
+        self, session_id: str, text: str, *, source: str = "user_typed"
+    ) -> None:
+        await self._ws.send_json(event_to_wire(TextFinal(
+            session_id=session_id, ts_ms=now_ms(),
+            text=text, source=source,  # type: ignore[arg-type]
+        )))
+
+    async def send_audio_chunk_in(
+        self,
+        session_id: str,
+        data: bytes,
+        *,
+        end_of_speech: bool = False,
+        sample_rate: int | None = None,
+        encoding: str | None = None,
+    ) -> None:
+        await self._ws.send_json(event_to_wire(AudioChunk(
+            session_id=session_id, ts_ms=now_ms(),
+            data=data, end_of_speech=end_of_speech,
+            sample_rate=sample_rate or 0, encoding=encoding or "",
+        )))
+
+    async def send_interrupt(
+        self, session_id: str, *, reason: str = "manual"
+    ) -> None:
+        await self._ws.send_json(event_to_wire(Interrupt(
+            session_id=session_id, ts_ms=now_ms(),
+            reason=reason,  # type: ignore[arg-type]
+        )))
 
     # REST helpers
     async def rest_get(self, path: str) -> dict:
