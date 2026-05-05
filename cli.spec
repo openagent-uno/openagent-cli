@@ -12,7 +12,10 @@ with no ``_internal/`` folder. The CLI bundle is ~13 MB compressed and
 starts in well under a second on every subsequent launch.
 """
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
+
+# Build-environment guard — see openagent.spec for rationale.
+import iroh  # noqa: F401 — P2P transport, Rust FFI dylib must be bundled
 
 block_cipher = None
 
@@ -26,6 +29,20 @@ hiddenimports = [
     *collect_submodules("aiohttp"),
     *collect_submodules("anyio"),
     "click",
+    # iroh: see openagent.spec for the full explanation. The CLI uses
+    # iroh via openagent.network.iroh_node + .client.session for the
+    # ``loopback`` / ``connect`` flows.
+    "iroh",
+    "iroh.iroh_ffi",
+    *collect_submodules("iroh"),
+    # The CLI imports openagent.network.* (client + iroh_node + transport)
+    # for the loopback flow. We exclude the heavy server modules below
+    # but still need the network subpackage.
+    *collect_submodules("openagent.network"),
+    "cbor2",
+    "srptools",
+    "cryptography",
+    *collect_submodules("cryptography"),
 ]
 
 # ── Data files ──
@@ -33,6 +50,10 @@ hiddenimports = [
 
 datas = []
 datas += collect_data_files("certifi")
+
+# ── Dynamic libs ──
+# iroh's Rust FFI library (libiroh_ffi.{so,dylib,dll}) — see openagent.spec.
+binaries = collect_dynamic_libs("iroh")
 
 # ── Analysis ──
 
