@@ -169,25 +169,331 @@ def cli():
 
 
 @cli.command()
-@click.argument("host_port", default="localhost:8765")
-@click.option("--token", "-t", default=None, help="Gateway auth token")
-def connect(host_port: str, token: str | None):
-    """Connect to an OpenAgent Gateway and start interactive session."""
-    url = f"ws://{host_port}/ws"
-    asyncio.run(_interactive(url, token))
+@click.argument("target")
+@click.option("--password", default=None, help="Password (omit to be prompted securely)")
+@click.option("--handle", "handle_override", default=None,
+              help="When redeeming a user-role ticket, the handle to register as.")
+@click.option("--agent", "agent_handle", default=None,
+              help="Specific agent handle to connect to (default: last used or first available)")
+def connect(target: str, password: str | None, handle_override: str | None,
+            agent_handle: str | None):
+    """Connect to an OpenAgent network and start interactive session.
+
+    \b
+    Two forms:
+      openagent-cli connect oa1abcdef…       # invite ticket — first time / new device
+      openagent-cli connect alice@homelab    # existing membership — just need password
+    """
+    asyncio.run(_run_connect(
+        target=target,
+        password=password,
+        handle_override=handle_override,
+        target_agent_handle=agent_handle,
+    ))
 
 
-async def _interactive(url: str, token: str | None):
-    client = GatewayClient(url, token)
+async def _run_connect(
+    *,
+    target: str,
+    password: str | None,
+    handle_override: str | None,
+    target_agent_handle: str | None,
+):
+    from openagent.network.cli_commands import parse_handle_at_network
+    from openagent.network import user_store
+    from openagent.network.client.login import (
+        LoginError,
+        register as net_register,
+        login as net_login,
+    )
+    from openagent.network.identity import load_or_create_identity
+    from openagent.network.iroh_node import IrohNode
+    from openagent.network.ticket import InviteTicket, TicketError, looks_like_ticket
+    import getpass
+
+    # Resolve target → (handle, network_name, coordinator_node_id?, invite_code?, ticket_role)
+    coordinator_node_id: str | None = None
+    invite_code: str | None = None
+    ticket_role: str | None = None
+    bind_to: str = ""
+    network_name: str
+    handle: str
+
+    if looks_like_ticket(target):
+        try:
+            ticket = InviteTicket.decode(target)
+        except TicketError as e:
+            console.print(f"[red]Invalid ticket:[/red] {e}")
+            return
+        coordinator_node_id = ticket.coordinator_node_id
+        invite_code = ticket.code
+        ticket_role = ticket.role
+        bind_to = ticket.bind_to
+        network_name = ticket.network_name
+        # ``role=device`` tickets are bound to a handle; user-role
+        # tickets let the new user pick one. We accept ``--handle`` to
+        # bypass the prompt entirely (useful for scripted setups).
+        if bind_to:
+            handle = bind_to
+        elif handle_override:
+            handle = handle_override.strip().lower()
+        else:
+            handle = Prompt.ask(
+                f"[bold]Choose a handle for {network_name}[/bold]",
+            ).strip().lower()
+            if not handle:
+                console.print("[red]Handle required.[/red]")
+                return
+    else:
+        try:
+            handle, network_name = parse_handle_at_network(target)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            console.print("[dim]Tip: paste an invite ticket (oa1…) for first-time connects.[/dim]")
+            return
+
+    store = user_store.load()
+    existing = user_store.find(store, network_name)
+    user_store.ensure_user_identity_dir()
+
+    if password is None:
+        password = getpass.getpass(f"Password for {handle}@{network_name}: ")
+    if not password:
+        console.print("[red]Password is required.[/red]")
+        return
+
+    from openagent.network.peers import coordinator_node_id_to_pubkey_bytes
+
+    device_identity = load_or_create_identity(user_store.user_identity_path())
+    node = IrohNode(device_identity)
+    await node.start()
+
+    try:
+        if existing is None:
+            # First-time onboarding for this network. The ticket carries
+            # everything we need (coordinator NodeId, network name + ID,
+            # invite code, role). The legacy --coordinator/--invite flags
+            # are gone — paste a ticket instead.
+            if coordinator_node_id is None or invite_code is None:
+                console.print(
+                    "[red]This network isn't in your user store.[/red] "
+                    "Paste an invite ticket (starts with [cyan]oa1[/cyan]) instead "
+                    "of [cyan]handle@network[/cyan] for first-time connects.",
+                )
+                return
+            coord_pubkey = coordinator_node_id_to_pubkey_bytes(coordinator_node_id)
+            try:
+                if ticket_role == "device":
+                    # Existing account, new device pairing — just login,
+                    # the coordinator binds the device key on success.
+                    cert_wire = await net_login(
+                        node=node,
+                        coordinator_node_id=coordinator_node_id,
+                        coordinator_pubkey_bytes=coord_pubkey,
+                        handle=handle,
+                        password=password,
+                        device_identity=device_identity,
+                        network_id="",  # learned from cert
+                        invite_code=invite_code,
+                    )
+                else:
+                    cert_wire = await net_register(
+                        node=node,
+                        coordinator_node_id=coordinator_node_id,
+                        coordinator_pubkey_bytes=coord_pubkey,
+                        handle=handle,
+                        password=password,
+                        invite_code=invite_code,
+                        device_identity=device_identity,
+                        network_id="",  # learned from cert; we don't ship it on the wire
+                    )
+            except LoginError as e:
+                console.print(f"[red]Login failed:[/red] {e}")
+                return
+            # The cert tells us the canonical network_id — verify and store.
+            from openagent.network.auth.device_cert import verify_cert
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            cert = verify_cert(
+                cert_wire,
+                coordinator_pubkey=Ed25519PublicKey.from_public_bytes(coord_pubkey),
+            )
+            stored = user_store.add_or_update(
+                store,
+                name=network_name,
+                network_id=cert.network_id,
+                coordinator_node_id=coordinator_node_id,
+                coordinator_pubkey_hex=coord_pubkey.hex(),
+                handle=handle,
+            )
+            user_store.write_cert(stored, cert_wire)
+            user_store.save(store)
+            console.print(f"[green]Joined {network_name!r} as {handle!r}.[/green]")
+        else:
+            # Existing membership — just refresh the cert.
+            try:
+                cert_wire = await net_login(
+                    node=node,
+                    coordinator_node_id=existing.coordinator_node_id,
+                    coordinator_pubkey_bytes=existing.coordinator_pubkey_bytes,
+                    handle=handle,
+                    password=password,
+                    device_identity=device_identity,
+                    network_id=existing.network_id,
+                )
+            except LoginError as e:
+                console.print(f"[red]Login failed:[/red] {e}")
+                return
+            user_store.write_cert(existing, cert_wire)
+            user_store.save(store)
+            stored = existing
+
+        # We have a fresh cert. Re-derive the binding + dialer + agent
+        # list, then hand off to the interactive REPL via from_network.
+        await node.stop()
+    except Exception:
+        await node.stop()
+        raise
+
+    try:
+        client = await GatewayClient.from_network(
+            handle=handle,
+            network_name=network_name,
+            password=password,
+            target_agent_handle=target_agent_handle,
+        )
+    except Exception as e:
+        console.print(f"[red]Could not open gateway connection:[/red] {e}")
+        return
+
     try:
         await client.connect()
     except Exception as e:
         console.print(f"[red]Connection failed:[/red] {e}")
+        await client.disconnect()
         return
 
+    # Persist the chosen agent so subsequent connects pick the same one.
+    if client.target_handle:
+        store2 = user_store.load()
+        store2.active_network = network_name
+        store2.active_agent = client.target_handle
+        user_store.save(store2)
+
+    await _interactive_loop(client, network_name=network_name, handle=handle)
+
+
+@cli.command("logout")
+@click.argument("network_name", required=False, default=None)
+def logout_cmd(network_name: str | None):
+    """Drop a network membership locally (cert + entry in the user store)."""
+    from openagent.network import user_store
+
+    store = user_store.load()
+    if network_name is None:
+        if not store.networks:
+            console.print("[yellow]No networks to log out from.[/yellow]")
+            return
+        for n in store.networks:
+            console.print(f"  - [cyan]{n.handle}@{n.name}[/cyan]")
+        console.print("[dim]Pass the network name as an argument to remove it.[/dim]")
+        return
+    ok = user_store.remove(store, network_name)
+    if ok:
+        user_store.save(store)
+        console.print(f"[green]Logged out of {network_name!r}.[/green]")
+    else:
+        console.print(f"[yellow]No such network: {network_name}[/yellow]")
+
+
+@cli.command("networks")
+def networks_cmd():
+    """List networks this device has joined."""
+    from openagent.network import user_store
+
+    store = user_store.load()
+    if not store.networks:
+        console.print("[dim]No networks joined.[/dim]")
+        return
+    table = Table(title="Joined networks")
+    table.add_column("Name", style="cyan")
+    table.add_column("Handle")
+    table.add_column("Coordinator NodeId", style="dim")
+    table.add_column("Active", justify="center")
+    for n in store.networks:
+        active = "✓" if store.active_network == n.name else ""
+        table.add_row(n.name, n.handle, n.coordinator_node_id[:24] + "…", active)
+    console.print(table)
+
+
+@cli.command("agents")
+@click.option("--network", "network_name", default=None,
+              help="Which network to list (default: active)")
+def agents_cmd(network_name: str | None):
+    """List agents in a network (queries the coordinator)."""
+    asyncio.run(_run_agents_cli(network_name))
+
+
+async def _run_agents_cli(network_name: str | None):
+    from openagent.network import user_store
+    from openagent.network.client.login import list_agents as coord_list_agents
+    from openagent.network.identity import load_or_create_identity
+    from openagent.network.iroh_node import IrohNode
+
+    store = user_store.load()
+    if network_name is None:
+        network_name = store.active_network
+    if network_name is None:
+        console.print("[red]No active network. Run `openagent-cli connect <handle>@<network>` first.[/red]")
+        return
+    net = user_store.find(store, network_name)
+    if net is None:
+        console.print(f"[red]Unknown network: {network_name}[/red]")
+        return
+    user_store.ensure_user_identity_dir()
+    device_identity = load_or_create_identity(user_store.user_identity_path())
+    node = IrohNode(device_identity)
+    await node.start()
+    try:
+        agents = await coord_list_agents(node=node, coordinator_node_id=net.coordinator_node_id)
+    finally:
+        await node.stop()
+    if not agents:
+        console.print("[dim]No agents registered.[/dim]")
+        return
+    table = Table(title=f"Agents in {network_name}")
+    table.add_column("Handle", style="cyan")
+    table.add_column("NodeId", style="dim")
+    table.add_column("Owner", style="dim")
+    table.add_column("Label")
+    table.add_column("Active", justify="center")
+    for a in agents:
+        active = "✓" if store.active_agent == a.get("handle") else ""
+        table.add_row(
+            a.get("handle", ""), a.get("node_id", "")[:24] + "…",
+            a.get("owner_handle", ""), a.get("label") or "", active,
+        )
+    console.print(table)
+
+
+@cli.command("use")
+@click.argument("agent_handle")
+def use_cmd(agent_handle: str):
+    """Set the default agent the next ``connect`` will pick."""
+    from openagent.network import user_store
+
+    store = user_store.load()
+    store.active_agent = agent_handle
+    user_store.save(store)
+    console.print(f"[green]Active agent set to {agent_handle!r}.[/green]")
+
+
+async def _interactive_loop(client: GatewayClient, *, network_name: str, handle: str):
+    """Drop-in for the legacy ``_interactive`` body — runs the REPL."""
+    target = client.target_handle or "agent"
     console.print(Panel(
         f"[bold]{client.agent_name}[/bold] v{client.agent_version}\n"
-        f"Gateway: {url}",
+        f"Network: [cyan]{network_name}[/cyan]   You: [cyan]{handle}[/cyan]   "
+        f"Agent: [cyan]{target}[/cyan]",
         title="Connected", border_style="green",
     ))
     console.print("[dim]Type /help for commands.[/dim]\n")
@@ -482,21 +788,15 @@ async def _settings_menu(client: GatewayClient):
 
 async def _channels_submenu(client: GatewayClient, cfg: dict):
     channels = cfg.get("channels", {}) or {}
-    console.print("\n[bold]Channels[/bold]: g(ateway), t(elegram), d(iscord), w(hatsApp)")
-    which = Prompt.ask("Edit", choices=["g", "t", "d", "w", "q"], default="q")
+    # The "g" (gateway/websocket) branch is gone — gateway transport
+    # is now Iroh + handle@network credentials managed outside this
+    # menu (`openagent network` subcommands and `openagent-cli connect`).
+    console.print("\n[bold]Channels[/bold]: t(elegram), d(iscord), w(hatsApp)")
+    which = Prompt.ask("Edit", choices=["t", "d", "w", "q"], default="q")
     if which == "q":
         return
 
-    if which == "g":
-        ws = channels.get("websocket", {}) or {}
-        host = Prompt.ask("Host", default=ws.get("host", "0.0.0.0"))
-        port = int(Prompt.ask("Port", default=str(ws.get("port", 8765))))
-        token = Prompt.ask("Token (blank for env var)", default=ws.get("token", ""))
-        new_channels = dict(channels)
-        new_channels["websocket"] = {"host": host, "port": port, "token": token}
-        await client.rest_patch("/api/config/channels", new_channels)
-
-    elif which == "t":
+    if which == "t":
         tg = channels.get("telegram", {}) or {}
         token = Prompt.ask("Bot token (blank to disable)", default=tg.get("token", ""))
         allowed = Prompt.ask("Allowed user IDs (comma-separated)", default=",".join(map(str, tg.get("allowed_users", []))))

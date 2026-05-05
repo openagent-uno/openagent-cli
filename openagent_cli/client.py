@@ -1,4 +1,10 @@
-"""WebSocket client for the OpenAgent Gateway."""
+"""WebSocket + REST client for the OpenAgent Gateway over Iroh.
+
+The legacy ``GatewayClient(url, token)`` constructor is preserved for
+introspection / tests, but new code should use ``GatewayClient.from_network``
+which performs the full ``handle@network`` → device-cert → loopback
+proxy → aiohttp wiring.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,13 @@ from typing import Callable
 import aiohttp
 
 from openagent.gateway import protocol as P
+from openagent.network import user_store
+from openagent.network.client.session import LoopbackProxy, SessionDialer
+from openagent.network.identity import (
+    Identity,
+    load_or_create_identity,
+)
+from openagent.network.iroh_node import IrohNode
 from openagent.stream.collector import StreamCollector, fold_outbound_event
 from openagent.stream.events import (
     AudioChunk, Interrupt, SessionClose, SessionOpen, TextFinal, now_ms,
@@ -22,9 +35,28 @@ logger = logging.getLogger(__name__)
 class GatewayClient:
     """Async WebSocket client to an OpenAgent Gateway."""
 
-    def __init__(self, url: str, token: str | None = None):
-        self.url = url
-        self.token = token
+    def __init__(
+        self,
+        url: str | None = None,
+        token: str | None = None,
+        *,
+        proxy: LoopbackProxy | None = None,
+        node: IrohNode | None = None,
+        dialer: SessionDialer | None = None,
+        target_handle: str | None = None,
+    ):
+        # Two construction paths: ``url`` for raw debugging /
+        # in-process tests, or the keyword bundle (proxy/node/dialer)
+        # produced by ``from_network``. Exactly one is required.
+        if url is None and proxy is None:
+            raise ValueError("GatewayClient needs either url= or proxy=")
+        self.url = url or proxy.ws_url
+        self.token = token  # legacy debugging only — ignored over Iroh transport
+        self._proxy = proxy
+        self._node = node
+        self._dialer = dialer
+        self.target_handle = target_handle
+
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._session: aiohttp.ClientSession | None = None
         # ``_stream_pending``: in-flight collectors keyed by session_id;
@@ -40,6 +72,131 @@ class GatewayClient:
         self._listener_task: asyncio.Task | None = None
         self.agent_name: str | None = None
         self.agent_version: str | None = None
+        self.agent_handle: str | None = None
+        self.network_id: str | None = None
+
+    @classmethod
+    async def from_network(
+        cls,
+        *,
+        handle: str,
+        network_name: str,
+        password: str | None = None,
+        invite_code: str | None = None,
+        target_agent_handle: str | None = None,
+    ) -> "GatewayClient":
+        """Build an authed client for ``handle@network_name``.
+
+        - Finds the network in the user store; raises ``LookupError``
+          if it isn't there (caller is expected to register first via
+          ``register_with_network``).
+        - Refreshes the cert if expired (requires *password*).
+        - Resolves the target agent's NodeId (defaults to the first
+          agent in the network).
+        - Spins up an Iroh node + a loopback proxy and returns a
+          GatewayClient bound to the proxy URL.
+        """
+        from openagent.network.client.login import list_agents as coord_list_agents
+        from openagent.network.client.login import refresh_cert
+        from openagent.network.auth.device_cert import verify_cert
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        store = user_store.load()
+        net = user_store.find(store, network_name)
+        if net is None:
+            raise LookupError(
+                f"network {network_name!r} not in user store; run `openagent-cli connect "
+                f"{handle}@{network_name} --invite <code>` first",
+            )
+        if net.handle != handle:
+            raise LookupError(
+                f"network {network_name!r} is bound to handle {net.handle!r}, not {handle!r}",
+            )
+
+        user_store.ensure_user_identity_dir()
+        device_identity = load_or_create_identity(user_store.user_identity_path())
+
+        node = IrohNode(device_identity)
+
+        # Cert: load from disk; refresh if missing/expired.
+        cert_wire = user_store.read_cert(net)
+        cert_valid = False
+        if cert_wire:
+            try:
+                pubkey = Ed25519PublicKey.from_public_bytes(net.coordinator_pubkey_bytes)
+                verify_cert(
+                    cert_wire,
+                    coordinator_pubkey=pubkey,
+                    expected_network_id=net.network_id,
+                )
+                cert_valid = True
+            except Exception:
+                cert_valid = False
+
+        if not cert_valid:
+            if password is None:
+                raise PermissionError(
+                    f"cert for {handle}@{network_name} is missing or expired; supply password=",
+                )
+            await node.start()
+            try:
+                cert_wire = await refresh_cert(
+                    node=node,
+                    coordinator_node_id=net.coordinator_node_id,
+                    coordinator_pubkey_bytes=net.coordinator_pubkey_bytes,
+                    handle=handle,
+                    password=password,
+                    device_identity=device_identity,
+                    network_id=net.network_id,
+                )
+                user_store.write_cert(net, cert_wire)
+                from openagent.network.user_store import save
+                import time as _time
+                net.last_login_at = _time.time()
+                save(store)
+            except Exception:
+                await node.stop()
+                raise
+        else:
+            await node.start()
+
+        from openagent.network.client.session import NetworkBinding
+        binding = NetworkBinding(
+            network_id=net.network_id,
+            network_name=net.name,
+            coordinator_node_id=net.coordinator_node_id,
+            coordinator_pubkey_bytes=net.coordinator_pubkey_bytes,
+            our_handle=handle,
+        )
+        dialer = SessionDialer(node=node, binding=binding, cert_wire=cert_wire)
+
+        # Resolve target agent: explicit handle wins; otherwise pick
+        # the first registered agent in the network. The user can
+        # override later with ``openagent-cli use <handle>``.
+        agents = await coord_list_agents(node=node, coordinator_node_id=net.coordinator_node_id)
+        if not agents:
+            await node.stop()
+            raise LookupError(f"no agents registered in network {network_name!r}")
+
+        chosen = None
+        if target_agent_handle:
+            chosen = next((a for a in agents if a.get("handle") == target_agent_handle), None)
+        elif store.active_agent:
+            chosen = next((a for a in agents if a.get("handle") == store.active_agent), None)
+        if chosen is None:
+            chosen = agents[0]
+        target_node_id = chosen["node_id"]
+        target_handle = chosen["handle"]
+
+        proxy = LoopbackProxy(dialer=dialer, target_node_id=target_node_id)
+        await proxy.start()
+
+        return cls(
+            proxy=proxy,
+            node=node,
+            dialer=dialer,
+            target_handle=target_handle,
+        )
 
     @property
     def base_url(self) -> str:
@@ -48,12 +205,16 @@ class GatewayClient:
     async def connect(self) -> None:
         self._session = aiohttp.ClientSession()
         self._ws = await self._session.ws_connect(self.url)
-        await self._ws.send_json({"type": P.AUTH, "token": self.token or "", "client_id": "cli"})
+        # Legacy AUTH frame is ignored by the new gateway, but sending
+        # it costs nothing and keeps wire compatibility tests passing.
+        await self._ws.send_json({"type": P.AUTH, "client_id": "cli"})
         resp = await self._ws.receive_json()
         if resp.get("type") == P.AUTH_ERROR:
             raise ConnectionError(f"Auth failed: {resp.get('reason')}")
         self.agent_name = resp.get("agent_name")
         self.agent_version = resp.get("version")
+        self.agent_handle = resp.get("handle")
+        self.network_id = resp.get("network")
         self._listener_task = asyncio.create_task(self._listen())
 
     async def disconnect(self) -> None:
@@ -63,6 +224,21 @@ class GatewayClient:
             await self._ws.close()
         if self._session:
             await self._session.close()
+        if self._proxy is not None:
+            try:
+                await self._proxy.stop()
+            except Exception:
+                pass
+        if self._dialer is not None:
+            try:
+                await self._dialer.close()
+            except Exception:
+                pass
+        if self._node is not None:
+            try:
+                await self._node.stop()
+            except Exception:
+                pass
         self._opened_sessions.clear()
         self._stream_pending.clear()
 
@@ -103,13 +279,7 @@ class GatewayClient:
         *,
         source: str = "user_typed",
     ) -> dict:
-        """Push a typed message into the user's stream session and await the reply.
-
-        Lazily opens a ``batched``-profile session on first call (with
-        ``speak=False`` since the CLI is text-only). Returns the legacy
-        answer-response dict shape: ``{type, text, model, attachments}``
-        or ``{type: "error", text}``.
-        """
+        """Push a typed message into the user's stream session and await the reply."""
         if session_id not in self._opened_sessions:
             await self._ws.send_json(event_to_wire(SessionOpen(
                 session_id=session_id,
@@ -158,8 +328,6 @@ class GatewayClient:
         return result.get("text", "")
 
     # ── Stream protocol helpers (opt-in) ────────────────────────────
-    # Used by scripted CLIs and integration tests that want the typed
-    # event vocabulary directly instead of the answer-response wrapper.
 
     async def send_session_open(
         self,
@@ -218,7 +386,6 @@ class GatewayClient:
             return await r.json()
 
     async def rest_patch(self, path: str, data) -> dict:
-        # `data` may be any JSON-serializable value (scalar, list, dict)
         async with self._session.patch(f"{self.base_url}{path}", json=data) as r:
             return await r.json()
 
@@ -240,19 +407,10 @@ class GatewayClient:
     async def download_file(self, remote_path: str, dest_path: str) -> int:
         """Fetch a file off the agent's filesystem via ``/api/files``.
 
-        Used to materialise attachments the agent returned in a
-        ``response`` message when this CLI is connected to a remote
-        gateway and can't read the path directly. Writes to
-        ``dest_path`` and returns the number of bytes written.
-
-        Raises ``RuntimeError`` with the status/reason when the gateway
-        rejects the request (401 unauthorised, 404 not found, etc.)
-        so the caller can surface a clean error to the user.
+        Auth is carried over the Iroh transport's cert prefix — no
+        token query parameter is appended anymore.
         """
-        params = {"path": remote_path}
-        if self.token:
-            params["token"] = self.token
-        async with self._session.get(f"{self.base_url}/api/files", params=params) as r:
+        async with self._session.get(f"{self.base_url}/api/files", params={"path": remote_path}) as r:
             if r.status != 200:
                 body = await r.text()
                 raise RuntimeError(f"{r.status} {body[:200]}")
