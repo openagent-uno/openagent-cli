@@ -139,6 +139,8 @@ def _print_help() -> None:
         ("/help", "Show this help"),
         ("/new", "Start a fresh conversation"),
         ("/sessions, /switch <id>", "List or switch sessions"),
+        ("/rename <id> <name>", "Rename a session"),
+        ("/delete <id>", "Delete a session (with confirmation)"),
         ("/file <path> [more...]", "Attach one or more files/images to the agent"),
         ("/stop", "Cancel the current operation"),
         ("/status", "Show agent status & queue"),
@@ -501,6 +503,32 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
     sessions = {"cli-default": "Default"}
     active = "cli-default"
 
+    # Hydrate from the server's persisted session list.
+    try:
+        data = await client.rest_get("/api/sessions")
+        for entry in data.get("sessions", []) or []:
+            sid = entry.get("session_id")
+            title = entry.get("title") or "Chat"
+            framework = entry.get("framework", "")
+            model = entry.get("model", "")
+            extra = []
+            if framework:
+                extra.append(framework)
+            if model:
+                extra.append(model)
+            label = title
+            if extra:
+                label = f"{title}  [dim]({' / '.join(extra)})[/dim]"
+            if sid and sid not in sessions:
+                sessions[sid] = label
+        if len(sessions) > 1:
+            # Pick the most recent server session as active.
+            first_server = data["sessions"][0]["session_id"]
+            if first_server in sessions:
+                active = first_server
+    except Exception:
+        pass
+
     while True:
         try:
             user_input = Prompt.ask("[bold]You[/bold]")
@@ -520,9 +548,13 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             continue
 
         if text == "/sessions":
-            for sid, name in sessions.items():
-                marker = "→ " if sid == active else "  "
-                console.print(f"{marker}[cyan]{sid[-8:]}[/cyan] {name}")
+            if len(sessions) <= 1 and next(iter(sessions)) == "cli-default":
+                console.print("[dim]No sessions yet. Start typing to create one.[/dim]")
+            else:
+                for sid, label in sessions.items():
+                    marker = "→ " if sid == active else "  "
+                    sid_short = sid[-12:] if len(sid) > 12 else sid
+                    console.print(f"{marker}[cyan]{sid_short}[/cyan] {label}")
             continue
 
         if text.startswith("/switch "):
@@ -541,6 +573,50 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             sessions[session_id] = f"Chat {len(sessions)}"
             active = session_id
             console.print(f"[green]{result}[/green]")
+            continue
+
+        if text.startswith("/rename "):
+            parts = text.split(" ", 2)
+            if len(parts) < 3:
+                console.print("[red]Usage: /rename <id_suffix> <new name>[/red]")
+                continue
+            target = parts[1].strip()
+            new_name = parts[2].strip()
+            found = [s for s in sessions if s.endswith(target)]
+            if not found:
+                console.print(f"[red]No session matching '{target}'[/red]")
+                continue
+            sid = found[0]
+            sessions[sid] = new_name
+            try:
+                await client.rest_patch(f"/api/sessions/{sid}", {"title": new_name})
+                console.print(f"[green]Renamed to '{new_name}'[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Renamed locally (server update failed: {e})[/yellow]")
+            continue
+
+        if text.startswith("/delete "):
+            target = text.split(" ", 1)[1].strip()
+            found = [s for s in sessions if s.endswith(target)]
+            if not found:
+                console.print(f"[red]No session matching '{target}'[/red]")
+                continue
+            sid = found[0]
+            label = sessions[sid]
+            confirm = Prompt.ask(
+                f"[yellow]Delete session '{label}'?[/yellow] Type [bold]yes[/bold] to confirm",
+            )
+            if confirm.strip().lower() != "yes":
+                console.print("[dim]Cancelled[/dim]")
+                continue
+            del sessions[sid]
+            if active == sid:
+                active = next(iter(sessions), "cli-default")
+            try:
+                await client.rest_delete(f"/api/sessions/{sid}")
+                console.print(f"[green]Deleted '{label}'[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Deleted locally (server cleanup failed: {e})[/yellow]")
             continue
 
         if text.startswith("/file "):
