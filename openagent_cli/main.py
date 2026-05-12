@@ -1487,6 +1487,56 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
     await _render_response(response, client=client)
 
 
+@cli.command("setup-claude")
+@click.option("--login", is_flag=True, help="Launch claude auth login after check/install")
+@click.option("--email", default=None, help="Pre-fill email for login")
+@click.option("--sso", is_flag=True, help="Use SSO for login")
+@click.option("--no-install", is_flag=True, help="Skip auto-install, only check status")
+def setup_claude_cmd(login: bool, email: str | None, sso: bool, no_install: bool):
+    """Check and optionally install the Claude Code CLI, then launch auth."""
+    try:
+        from openagent.models.claude_install import (
+            find_claude_binary,
+            ensure_claude_binary,
+            check_claude_auth,
+            launch_claude_login,
+        )
+    except ImportError:
+        console.print("[red]Claude setup requires the openagent package.[/red]")
+        return
+
+    binary = find_claude_binary()
+    if binary is None:
+        console.print("[yellow]Claude Code CLI not found.[/yellow]")
+        if no_install:
+            console.print("[dim]Skipping install (--no-install).[/dim]")
+            console.print("[dim]Install manually: curl -fsSL https://claude.ai/install.sh | bash[/dim]")
+            return
+        console.print("[dim]Attempting auto-install…[/dim]")
+        binary = ensure_claude_binary()
+        if binary is None:
+            console.print("[red]Auto-install failed.[/red]")
+            console.print("[dim]Install manually: curl -fsSL https://claude.ai/install.sh | bash[/dim]")
+            return
+        console.print(f"[green]Claude Code installed: {binary}[/green]")
+    else:
+        console.print(f"[dim]Binary: {binary}[/dim]")
+
+    auth = check_claude_auth(binary_path=binary)
+    if auth.logged_in:
+        console.print(f"[green]Logged in as: {auth.email or auth.account_type or 'unknown'}[/green]")
+    else:
+        console.print("[yellow]Not authenticated.[/yellow]")
+
+    if login:
+        proc = launch_claude_login(email=email, sso=sso, binary_path=binary)
+        if proc is None:
+            console.print("[red]Failed to launch claude auth login[/red]")
+        else:
+            console.print("[green]Browser launched for OAuth login.[/green]")
+            console.print("[dim]Run 'openagent-cli setup-claude' again to check status.[/dim]")
+
+
 def main():
     cli()
 
