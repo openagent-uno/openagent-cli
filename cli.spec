@@ -24,7 +24,7 @@ block_cipher = None
 # the openagent_cli package itself.
 
 hiddenimports = [
-    *collect_submodules("openagent_cli"),
+    *collect_submodules("src"),
     *collect_submodules("rich"),
     *collect_submodules("aiohttp"),
     *collect_submodules("anyio"),
@@ -58,7 +58,7 @@ binaries = collect_dynamic_libs("iroh")
 # ── Analysis ──
 
 a = Analysis(
-    ["openagent_cli/main.py"],
+    ["src/main.py"],
     pathex=["."],
     binaries=[],
     datas=datas,

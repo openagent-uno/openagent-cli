@@ -26,8 +26,7 @@ set -euo pipefail
 APP="${1:?usage: $0 <app> <dist-dir>}"
 DIST="${2:?usage: $0 <app> <dist-dir>}"
 
-# Python module name mirrors the app name with hyphens → underscores.
-MODULE="${APP//-/_}"
+MODULE="src"
 
 # ── Detect OS and arch in release-filename convention ────────────────
 

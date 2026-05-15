@@ -24,7 +24,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from openagent_cli.client import GatewayClient
+from src.client import GatewayClient
 
 console = Console()
 
