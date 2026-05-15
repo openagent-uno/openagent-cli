@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: ubuntu-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CLI deps + PyInstaller
+        run: pip install -e . pyinstaller
+      - name: Build CLI executable
+        run: pyinstaller cli.spec --clean --noconfirm
+      - name: Sign + notarize macOS CLI binary (+ build stapled .pkg)
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_LINK_INSTALLER: ${{ secrets.CSC_LINK_INSTALLER }}
+          CSC_KEY_PASSWORD_INSTALLER: ${{ secrets.CSC_KEY_PASSWORD_INSTALLER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli com.openagent.cli /usr/local/bin
+      - name: Package + checksum
+        shell: bash
+        run: bash scripts/package-release.sh openagent-cli dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}
+          path: |
+            dist/openagent-cli-*.tar.gz
+            dist/openagent-cli-*.zip
+            dist/openagent-cli-*.sha256
+            dist/openagent-cli-*.pkg
+
+  release:
+    needs: cli
+    if: always() && needs.cli.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List artifacts
+        run: find artifacts -type f | head -40
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/*.sha256
+            artifacts/**/*.pkg
+          generate_release_notes: true

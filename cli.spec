@@ -58,8 +58,8 @@ binaries = collect_dynamic_libs("iroh")
 # ── Analysis ──
 
 a = Analysis(
-    ["cli/openagent_cli/main.py"],
-    pathex=["cli"],
+    ["openagent_cli/main.py"],
+    pathex=["."],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
