@@ -489,6 +489,255 @@ def use_cmd(agent_handle: str):
     console.print(f"[green]Active agent set to {agent_handle!r}.[/green]")
 
 
+# ── /api/network/* — members & invitations via the gateway ─────────────
+
+
+async def _open_gateway_for_rest(network_name: str | None, password: str | None):
+    """Spin up an authed GatewayClient for one-shot REST calls.
+
+    Loads the active network from the user store, refreshes the
+    device cert if needed (prompting for the password when the
+    cached cert can't be reused), opens the loopback proxy + WS,
+    and returns the live client. Caller is responsible for closing.
+    """
+    import getpass
+    from openagent.network import user_store
+
+    store = user_store.load()
+    if network_name is None:
+        network_name = store.active_network
+    if network_name is None:
+        console.print(
+            "[red]No active network.[/red] Run "
+            "[cyan]openagent-cli connect <handle>@<network>[/cyan] first."
+        )
+        return None, None
+
+    net = user_store.find(store, network_name)
+    if net is None:
+        console.print(f"[red]Unknown network: {network_name}[/red]")
+        return None, None
+
+    # The cert may be valid (no password needed) or expired (prompt).
+    # GatewayClient.from_network handles both branches — we just need
+    # to surface the prompt before it raises PermissionError.
+    try:
+        client = await GatewayClient.from_network(
+            handle=net.handle, network_name=network_name,
+            password=password,
+        )
+    except PermissionError:
+        if password is None:
+            password = getpass.getpass(f"Password for {net.handle}@{network_name}: ")
+        client = await GatewayClient.from_network(
+            handle=net.handle, network_name=network_name,
+            password=password,
+        )
+    await client.connect()
+    return client, net
+
+
+def _fmt_age(unix_seconds: float | None) -> str:
+    """Render a unix timestamp as a short relative age."""
+    if not unix_seconds:
+        return ""
+    import time as _time
+    delta = max(0, _time.time() - unix_seconds)
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def _fmt_expires(unix_seconds: float | None) -> str:
+    if not unix_seconds:
+        return ""
+    import time as _time
+    delta = unix_seconds - _time.time()
+    if delta < 0:
+        return "expired"
+    if delta < 3600:
+        return f"in {int(delta // 60)}m"
+    if delta < 86400:
+        return f"in {int(delta // 3600)}h"
+    return f"in {int(delta // 86400)}d"
+
+
+@cli.command("users")
+@click.option("--network", "network_name", default=None,
+              help="Which network to query (default: active)")
+@click.option("--password", default=None,
+              help="Password (omit to be prompted only if the cached cert is stale).")
+def users_cmd(network_name: str | None, password: str | None):
+    """List users registered in this network (authed)."""
+    asyncio.run(_run_users_cli(network_name, password))
+
+
+async def _run_users_cli(network_name: str | None, password: str | None):
+    client, net = await _open_gateway_for_rest(network_name, password)
+    if client is None:
+        return
+    try:
+        data = await client.rest_get("/api/network/users")
+        users = data.get("users") or []
+        if not users:
+            console.print("[dim]No users registered.[/dim]")
+            return
+        table = Table(title=f"Users in {net.name}")
+        table.add_column("Handle", style="cyan")
+        table.add_column("Status")
+        table.add_column("PAKE", style="dim")
+        table.add_column("Joined", style="dim")
+        for u in users:
+            table.add_row(
+                u.get("handle", ""), u.get("status", ""),
+                u.get("pake_algo", ""), _fmt_age(u.get("created_at")),
+            )
+        console.print(table)
+    finally:
+        await client.close()
+
+
+@cli.command("members")
+@click.option("--network", "network_name", default=None,
+              help="Which network to query (default: active)")
+@click.option("--password", default=None)
+def members_cmd(network_name: str | None, password: str | None):
+    """Show users + agents on this network in one view."""
+    asyncio.run(_run_members_cli(network_name, password))
+
+
+async def _run_members_cli(network_name: str | None, password: str | None):
+    client, net = await _open_gateway_for_rest(network_name, password)
+    if client is None:
+        return
+    try:
+        users_data, agents_data = await asyncio.gather(
+            client.rest_get("/api/network/users"),
+            client.rest_get("/api/network/agents"),
+        )
+        utable = Table(title=f"Users on {net.name}")
+        utable.add_column("Handle", style="cyan")
+        utable.add_column("Status")
+        utable.add_column("Joined", style="dim")
+        for u in users_data.get("users", []) or []:
+            utable.add_row(u.get("handle", ""), u.get("status", ""),
+                           _fmt_age(u.get("created_at")))
+        console.print(utable)
+
+        atable = Table(title=f"Agents on {net.name}")
+        atable.add_column("Handle", style="cyan")
+        atable.add_column("NodeId", style="dim")
+        atable.add_column("Last seen", style="dim")
+        for a in agents_data.get("agents", []) or []:
+            atable.add_row(
+                a.get("handle", ""),
+                (a.get("node_id") or "")[:24] + "…",
+                _fmt_age(a.get("last_seen")),
+            )
+        console.print(atable)
+    finally:
+        await client.close()
+
+
+@cli.command("invitations")
+@click.option("--network", "network_name", default=None)
+@click.option("--password", default=None)
+def invitations_cmd(network_name: str | None, password: str | None):
+    """List active invite codes on this network (coordinator-only)."""
+    asyncio.run(_run_invitations_cli(network_name, password))
+
+
+async def _run_invitations_cli(network_name: str | None, password: str | None):
+    client, net = await _open_gateway_for_rest(network_name, password)
+    if client is None:
+        return
+    try:
+        data = await client.rest_get("/api/network/invitations")
+        invs = data.get("invitations") or []
+        if not invs:
+            console.print("[dim]No active invitations.[/dim]")
+            return
+        table = Table(title=f"Active invitations on {net.name}")
+        table.add_column("Code", style="cyan")
+        table.add_column("For")
+        table.add_column("Expires", style="dim")
+        table.add_column("Minted by", style="dim")
+        for inv in invs:
+            bind = inv.get("bind_to") or ""
+            role = inv.get("role") or ""
+            # Operator-readable label: hide the role jargon when there's
+            # a bound handle (the audience already conveys intent).
+            audience = (
+                f"new device for {bind}" if role == "device" and bind
+                else f"onboard {bind}" if bind
+                else "any new user" if role == "user"
+                else f"agent (owner={inv.get('bind_to') or 'system'})" if role == "agent"
+                else role
+            )
+            table.add_row(
+                inv.get("code", ""),
+                audience,
+                _fmt_expires(inv.get("expires_at")),
+                inv.get("created_by", ""),
+            )
+        console.print(table)
+    finally:
+        await client.close()
+
+
+@cli.command("invite")
+@click.argument("handle", required=False, default=None)
+@click.option("--network", "network_name", default=None,
+              help="Which network to mint on (default: active)")
+@click.option("--ttl", default=7 * 24 * 3600, show_default=True, type=int,
+              help="Invite TTL in seconds (max 90 days).")
+@click.option("--password", default=None)
+@click.option("--role", default=None, hidden=True,
+              help="Advanced: force user|device|agent. Defaults to auto-detect.")
+def invite_cmd(handle: str | None, network_name: str | None,
+               ttl: int, password: str | None, role: str | None):
+    """Mint an invite ticket.
+
+    \b
+      openagent-cli invite                 # open invite, anyone joins
+      openagent-cli invite marco           # auto: onboard marco (new user)
+      openagent-cli invite alessandro      # auto: new-device invite for alessandro
+    """
+    asyncio.run(_run_invite_cli(handle, network_name, ttl, password, role))
+
+
+async def _run_invite_cli(handle: str | None, network_name: str | None,
+                          ttl: int, password: str | None, role: str | None):
+    client, net = await _open_gateway_for_rest(network_name, password)
+    if client is None:
+        return
+    try:
+        body: dict = {"ttl": ttl}
+        if handle is not None:
+            body["handle"] = handle
+        if role is not None:
+            body["role"] = role
+        data = await client.rest_post("/api/network/invitations", data=body)
+        if "error" in data:
+            console.print(f"[red]{data['error']}[/red]")
+            return
+        console.print()
+        console.print(
+            f"[green]Invite ticket[/green] — [dim]{data.get('intent','')}, "
+            f"expires {_fmt_expires(data.get('expires_at'))}[/dim]"
+        )
+        console.print(f"\n  [bold cyan]{data.get('ticket','')}[/bold cyan]\n")
+        console.print(
+            f"  Redeem with: [cyan]openagent-cli connect {data.get('ticket','')}[/cyan]\n"
+        )
+    finally:
+        await client.close()
+
+
 async def _interactive_loop(client: GatewayClient, *, network_name: str, handle: str):
     """Drop-in for the legacy ``_interactive`` body — runs the REPL."""
     target = client.target_handle or "agent"
