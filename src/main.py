@@ -255,7 +255,7 @@ async def _run_connect(
             return
 
     store = user_store.load()
-    existing = user_store.find(store, network_name)
+    existing = user_store.find(store, network_name, handle)
     user_store.ensure_user_identity_dir()
 
     if password is None:

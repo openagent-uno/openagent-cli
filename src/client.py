@@ -102,15 +102,11 @@ class GatewayClient:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         store = user_store.load()
-        net = user_store.find(store, network_name)
+        net = user_store.find(store, network_name, handle)
         if net is None:
             raise LookupError(
                 f"network {network_name!r} not in user store; run `openagent-cli connect "
                 f"{handle}@{network_name} --invite <code>` first",
-            )
-        if net.handle != handle:
-            raise LookupError(
-                f"network {network_name!r} is bound to handle {net.handle!r}, not {handle!r}",
             )
 
         user_store.ensure_user_identity_dir()
