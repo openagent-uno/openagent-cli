@@ -220,6 +220,7 @@ async def _run_connect(
     bind_to: str = ""
     network_name: str
     handle: str
+    ticket: InviteTicket | None = None
 
     if looks_like_ticket(target):
         try:
@@ -284,6 +285,13 @@ async def _run_connect(
                 )
                 return
             coord_pubkey = coordinator_node_id_to_pubkey_bytes(coordinator_node_id)
+            # First-contact addressing hints from the ticket. The
+            # coordinator's NodeId may not yet be in our local iroh
+            # discovery cache (just-restarted pod, post-DMG-install
+            # mDNS permission gate, etc.); passing the relay + direct
+            # addresses lets the dial skip discovery entirely.
+            ticket_relay = getattr(ticket, "relay_url", None) if ticket else None
+            ticket_addrs = list(getattr(ticket, "addresses", None) or []) if ticket else []
             try:
                 if ticket_role == "device":
                     # Existing account, new device pairing — just login,
@@ -297,6 +305,8 @@ async def _run_connect(
                         device_identity=device_identity,
                         network_id="",  # learned from cert
                         invite_code=invite_code,
+                        relay_url=ticket_relay,
+                        addresses=ticket_addrs,
                     )
                 else:
                     cert_wire = await net_register(
@@ -308,6 +318,8 @@ async def _run_connect(
                         invite_code=invite_code,
                         device_identity=device_identity,
                         network_id="",  # learned from cert; we don't ship it on the wire
+                        relay_url=ticket_relay,
+                        addresses=ticket_addrs,
                     )
             except LoginError as e:
                 console.print(f"[red]Login failed:[/red] {e}")
@@ -326,12 +338,20 @@ async def _run_connect(
                 coordinator_node_id=coordinator_node_id,
                 coordinator_pubkey_hex=coord_pubkey.hex(),
                 handle=handle,
+                coordinator_relay_url=ticket_relay,
+                coordinator_addresses=ticket_addrs,
             )
             user_store.write_cert(stored, cert_wire)
             user_store.save(store)
             console.print(f"[green]Joined {network_name!r} as {handle!r}.[/green]")
         else:
-            # Existing membership — just refresh the cert.
+            # Existing membership — just refresh the cert. Prefer any
+            # fresh address hints from the pasted ticket; fall back to
+            # the addresses we cached the last time we joined.
+            ticket_relay = getattr(ticket, "relay_url", None) if ticket else None
+            ticket_addrs = list(getattr(ticket, "addresses", None) or []) if ticket else []
+            relay_hint = ticket_relay or existing.coordinator_relay_url
+            addrs_hint = ticket_addrs or existing.coordinator_addresses
             try:
                 cert_wire = await net_login(
                     node=node,
@@ -341,11 +361,27 @@ async def _run_connect(
                     password=password,
                     device_identity=device_identity,
                     network_id=existing.network_id,
+                    relay_url=relay_hint,
+                    addresses=addrs_hint,
                 )
             except LoginError as e:
                 console.print(f"[red]Login failed:[/red] {e}")
                 return
             user_store.write_cert(existing, cert_wire)
+            # If the user pasted a fresh ticket, persist the new
+            # hints — coordinators rotate ports across restarts and the
+            # old cached addresses can go stale.
+            if ticket_relay or ticket_addrs:
+                user_store.add_or_update(
+                    store,
+                    name=existing.name,
+                    network_id=existing.network_id,
+                    coordinator_node_id=existing.coordinator_node_id,
+                    coordinator_pubkey_hex=existing.coordinator_pubkey_hex,
+                    handle=existing.handle,
+                    coordinator_relay_url=ticket_relay,
+                    coordinator_addresses=ticket_addrs,
+                )
             user_store.save(store)
             stored = existing
 
