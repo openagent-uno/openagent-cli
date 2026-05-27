@@ -1411,6 +1411,7 @@ async def _models_menu(client: GatewayClient):
         table.add_column("Model", style="cyan")
         table.add_column("Status")
         table.add_column("Router")
+        table.add_column("Tier hint", style="dim")
         table.add_column("Cost (in/out $/M)", justify="right")
         for i, m in enumerate(db_models):
             status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
@@ -1422,16 +1423,27 @@ async def _models_menu(client: GatewayClient):
                 in_c = m.get("input_cost_per_million")
                 out_c = m.get("output_cost_per_million")
                 cost = f"{in_c or '-'} / {out_c or '-'}"
+            tier = str(m.get("tier_hint") or "")
+            if len(tier) > 32:
+                tier = tier[:31] + "…"
+            model_id = str(m.get("model", ""))
+            display = str(m.get("display_name") or "").strip()
+            # Show the friendly name when set, with the bare model id as a
+            # dim subtitle so the surrogate is still visible at a glance.
+            if display:
+                model_cell = f"{display}\n[dim]{model_id}[/dim]"
+            else:
+                model_cell = model_id
             table.add_row(
                 str(i + 1), str(m.get("id", "")), fw,
                 str(m.get("provider_name", "")),
-                str(m.get("model", "")), status, router, cost,
+                model_cell, status, router, tier, cost,
             )
         console.print(table)
 
         console.print(
             "\n[cyan]a[/cyan]dd, [cyan]t<#>[/cyan] toggle, [cyan]c<#>[/cyan] set as router/classifier, "
-            "[cyan]r<#>[/cyan] remove, [cyan]p<#>[/cyan] pin to session, "
+            "[cyan]e<#>[/cyan] edit hints + name, [cyan]r<#>[/cyan] remove, [cyan]p<#>[/cyan] pin to session, "
             "[cyan]u[/cyan]npin session, [cyan]q[/cyan]uit"
         )
         action = Prompt.ask("Action", default="q").strip().lower()
@@ -1492,15 +1504,19 @@ async def _models_menu(client: GatewayClient):
             if not (0 <= idx < len(avail)):
                 continue
             picked = avail[idx]
+            tier_hint = Prompt.ask("tier hint (blank to skip)", default="").strip()
+            name = Prompt.ask("name (blank for default)", default="").strip()
+            payload = {
+                "provider_id": provider_row["id"],
+                "model": picked.get("id"),
+                "display_name": picked.get("display_name"),
+            }
+            if tier_hint:
+                payload["tier_hint"] = tier_hint
+            if name:
+                payload["display_name"] = name
             try:
-                await client.rest_post(
-                    "/api/models",
-                    {
-                        "provider_id": provider_row["id"],
-                        "model": picked.get("id"),
-                        "display_name": picked.get("display_name"),
-                    },
-                )
+                await client.rest_post("/api/models", payload)
                 console.print("[green]Added. Live on next message.[/green]")
             except Exception as e:
                 console.print(f"[red]{e}[/red]")
@@ -1533,6 +1549,32 @@ async def _models_menu(client: GatewayClient):
                     )
                     label = "set as router" if new_flag else "cleared router flag"
                     console.print(f"[green]{label}. Live on next message.[/green]")
+                except Exception as e:
+                    console.print(f"[red]{e}[/red]")
+
+        elif action.startswith("e") and action[1:].isdigit():
+            # Edit tier_hint / display_name. The tier_hint is what the leader
+            # uses to delegate to specialist sub-agents; display_name is the
+            # friendly label shown in the catalog. Blank input explicitly
+            # clears either field (sent as null).
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(db_models):
+                m = db_models[idx]
+                new_tier = Prompt.ask(
+                    "tier hint (blank to clear)",
+                    default=m.get("tier_hint") or "",
+                ).strip()
+                new_name = Prompt.ask(
+                    "name (blank to clear)",
+                    default=m.get("display_name") or "",
+                ).strip()
+                payload = {
+                    "tier_hint": new_tier or None,
+                    "display_name": new_name or None,
+                }
+                try:
+                    await client.rest_put(f"/api/models/{m['id']}", payload)
+                    console.print("[green]Updated. Live on next message.[/green]")
                 except Exception as e:
                     console.print(f"[red]{e}[/red]")
 
