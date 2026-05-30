@@ -152,6 +152,7 @@ def _print_help() -> None:
         ("/providers", "List, test, add providers"),
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
         ("/tasks", "Manage scheduled tasks"),
+        ("/workflows", "List workflows, toggle, run, set concurrency cap"),
         ("/config", "Show config summary"),
         ("/restart", "Restart the agent"),
         ("/update", "Check for and install updates"),
@@ -928,6 +929,10 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             await _tasks_menu(client)
             continue
 
+        if text in ("/workflows", "/workflow"):
+            await _workflows_menu(client)
+            continue
+
         if text == "/mcps":
             await _mcps_menu(client)
             continue
@@ -1297,6 +1302,151 @@ async def _tasks_menu(client: GatewayClient):
                 )
                 if res.get("error"):
                     console.print(f"[red]{res['error']}[/red]")
+
+
+# ── Workflows ────────────────────────────────────────────────────────────
+
+
+def _fmt_concurrency(cap: int | None) -> str:
+    """Render the concurrency cap as a compact cell. ``None`` is the
+    default (unlimited); display it as ``∞`` so the column never
+    becomes confusing whitespace."""
+    if cap is None:
+        return "∞"
+    return f"≤{cap}"
+
+
+async def _workflows_menu(client: GatewayClient):
+    """Workflow registry — DB-backed via ``/api/workflows``.
+
+    Visual editing of the graph lives in the desktop app; the CLI menu
+    focuses on the cross-cutting toggles a terminal user actually
+    needs: enable/disable, trigger a manual run, and the new
+    ``max_concurrent_runs`` cap that decides how many overlapping runs
+    of the same workflow may execute (empty / NULL = unlimited).
+    """
+    while True:
+        data = await client.rest_get("/api/workflows")
+        rows = data.get("workflows", []) or []
+
+        table = Table(title=f"Workflows ({len(rows)})")
+        table.add_column("#", width=3)
+        table.add_column("Name", style="cyan")
+        table.add_column("Triggers", style="dim")
+        table.add_column("On", width=3)
+        table.add_column("Concurrent", justify="center")
+        table.add_column("Blocks", justify="right")
+        for i, w in enumerate(rows):
+            trig = ",".join(
+                t.replace("trigger-", "") for t in (w.get("trigger_types") or [])
+            ) or "—"
+            cap = w.get("max_concurrent_runs")
+            cap_cell = _fmt_concurrency(cap if cap is None else int(cap))
+            nodes = (w.get("graph") or {}).get("nodes") or []
+            table.add_row(
+                str(i + 1),
+                w.get("name", "?"),
+                trig,
+                "✓" if w.get("enabled") else "—",
+                cap_cell,
+                str(len(nodes)),
+            )
+        console.print(table)
+        console.print(
+            "[cyan]r[/cyan]un #, [cyan]t[/cyan]oggle #, "
+            "[cyan]c[/cyan]oncurrency #, [cyan]d[/cyan]elete #, "
+            "[cyan]q[/cyan]uit"
+        )
+        action = Prompt.ask("Action", default="q").strip().lower()
+
+        if action in ("q", ""):
+            return
+
+        if action.startswith("r") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(rows):
+                w = rows[idx]
+                console.print(
+                    f"[dim]Running '{w.get('name')}' (wait up to 5 min)…[/dim]"
+                )
+                res = await client.rest_post(
+                    f"/api/workflows/{w['id']}/run",
+                    {"wait": True, "timeout_s": 300},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    status = res.get("status") if isinstance(res, dict) else None
+                    if status == "success":
+                        console.print("[green]Run finished: success.[/green]")
+                    elif status:
+                        console.print(f"[yellow]Run finished: {status}.[/yellow]")
+                    else:
+                        console.print("[dim]Run dispatched.[/dim]")
+
+        elif action.startswith("t") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(rows):
+                w = rows[idx]
+                res = await client.rest_patch(
+                    f"/api/workflows/{w['id']}",
+                    {"enabled": not w.get("enabled")},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+
+        elif action.startswith("c") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(rows):
+                w = rows[idx]
+                current_cap = w.get("max_concurrent_runs")
+                current = "" if current_cap is None else str(int(current_cap))
+                console.print(
+                    "[dim]Max concurrent runs of this workflow. "
+                    "Empty = unlimited (default), 1 = serial, N = up to N "
+                    "at a time.[/dim]"
+                )
+                raw = Prompt.ask("Max concurrent runs", default=current)
+                raw = raw.strip()
+                if raw == "":
+                    new_cap: int | None = None
+                else:
+                    try:
+                        new_cap = int(raw)
+                    except ValueError:
+                        console.print(
+                            "[red]Must be a whole number ≥ 1, or empty.[/red]"
+                        )
+                        continue
+                    if new_cap < 1:
+                        console.print(
+                            "[red]Must be ≥ 1 (or empty for unlimited).[/red]"
+                        )
+                        continue
+                res = await client.rest_patch(
+                    f"/api/workflows/{w['id']}",
+                    {"max_concurrent_runs": new_cap},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    console.print(
+                        f"[green]Concurrency cap → {_fmt_concurrency(new_cap)}.[/green]"
+                    )
+
+        elif action.startswith("d") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(rows):
+                w = rows[idx]
+                if Confirm.ask(
+                    f"Delete workflow '{w.get('name')}' and its run history?",
+                    default=False,
+                ):
+                    res = await client.rest_delete(f"/api/workflows/{w['id']}")
+                    if isinstance(res, dict) and res.get("error"):
+                        console.print(f"[red]{res['error']}[/red]")
+                    else:
+                        console.print("[green]Deleted.[/green]")
 
 
 # ── MCPs ─────────────────────────────────────────────────────────────────
