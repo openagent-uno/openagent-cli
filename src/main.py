@@ -151,8 +151,8 @@ def _print_help() -> None:
         ("/models", "List providers & switch active model"),
         ("/providers", "List, test, add providers"),
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
-        ("/tasks", "Manage scheduled tasks"),
-        ("/workflows", "List workflows, toggle, run, set concurrency cap"),
+        ("/tasks", "Manage scheduled tasks + view run history"),
+        ("/workflows", "List workflows, run, view run history, set concurrency"),
         ("/config", "Show config summary"),
         ("/restart", "Restart the agent"),
         ("/update", "Check for and install updates"),
@@ -1215,6 +1215,84 @@ async def _channels_submenu(client: GatewayClient, cfg: dict):
     console.print("[green]Saved. Restart required for channel changes.[/green]")
 
 
+# ── Run history (shared by workflows + scheduled tasks) ──────────────────
+
+
+def _run_status_markup(status: str) -> str:
+    """Colour a run status the same way across both history tables."""
+    color = {
+        "success": "green",
+        "failed": "red",
+        "running": "yellow",
+        "cancelled": "dim",
+    }.get(status, "white")
+    return f"[{color}]{status}[/{color}]"
+
+
+def _fmt_run_duration(run: dict) -> str:
+    started = run.get("started_at")
+    finished = run.get("finished_at")
+    if started and finished:
+        return f"{finished - started:.2f}s"
+    if run.get("status") == "running":
+        return "…"
+    return "—"
+
+
+def _run_detail(run: dict) -> str:
+    """One-line detail cell: the error wins, else an output preview.
+
+    Task runs carry a plain ``output`` string; workflow runs carry an
+    ``outputs`` dict — collapse either into a short single line."""
+    err = run.get("error")
+    if err:
+        return str(err).replace("\n", " ")[:80]
+    out = run.get("output")
+    if out is None:
+        outputs = run.get("outputs")
+        if outputs:
+            out = json.dumps(outputs)
+    if out:
+        return str(out).replace("\n", " ")[:80]
+    return ""
+
+
+async def _show_runs(client: GatewayClient, base: str, item: dict, kind: str):
+    """Fetch and print the recent run history for one workflow / task.
+
+    ``base`` is the collection path (``/api/workflows`` or
+    ``/api/scheduled-tasks``); ``item`` is the selected row. Mirrors the
+    desktop app's RunHistoryDrawer as a terminal table (newest first).
+    """
+    name = item.get("name", "?")
+    data = await client.rest_get(f"{base}/{item['id']}/runs?limit=20")
+    if isinstance(data, dict) and data.get("error"):
+        console.print(f"[red]{data['error']}[/red]")
+        return
+    runs = (data.get("runs") if isinstance(data, dict) else None) or []
+    if not runs:
+        console.print(f"[dim]No runs recorded for '{name}' yet.[/dim]")
+        return
+
+    table = Table(title=f"{kind} runs — {name} ({len(runs)})")
+    table.add_column("#", width=3)
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Dur", justify="right")
+    table.add_column("Trigger", style="dim")
+    table.add_column("Detail", max_width=80)
+    for i, r in enumerate(runs):
+        table.add_row(
+            str(i + 1),
+            _run_status_markup(r.get("status", "?")),
+            r.get("started_at_iso") or "—",
+            _fmt_run_duration(r),
+            r.get("trigger", "—"),
+            _run_detail(r),
+        )
+    console.print(table)
+
+
 # ── Tasks (cron) ─────────────────────────────────────────────────────────
 
 async def _tasks_menu(client: GatewayClient):
@@ -1242,7 +1320,7 @@ async def _tasks_menu(client: GatewayClient):
                 (t.get("prompt", ""))[:50],
             )
         console.print(table)
-        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle #, [cyan]q[/cyan]uit")
+        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]h[/cyan]istory #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle #, [cyan]q[/cyan]uit")
         action = Prompt.ask("Action", default="q")
         action = action.strip().lower()
 
@@ -1280,6 +1358,13 @@ async def _tasks_menu(client: GatewayClient):
                     console.print(f"[red]{res['error']}[/red]")
                 else:
                     console.print("[green]Saved.[/green]")
+
+        elif action.startswith("h") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(tasks):
+                await _show_runs(
+                    client, "/api/scheduled-tasks", tasks[idx], "Task",
+                )
 
         elif action.startswith("d") and action[1:].isdigit():
             idx = int(action[1:]) - 1
@@ -1353,7 +1438,7 @@ async def _workflows_menu(client: GatewayClient):
             )
         console.print(table)
         console.print(
-            "[cyan]r[/cyan]un #, [cyan]t[/cyan]oggle #, "
+            "[cyan]r[/cyan]un #, [cyan]h[/cyan]istory #, [cyan]t[/cyan]oggle #, "
             "[cyan]c[/cyan]oncurrency #, [cyan]d[/cyan]elete #, "
             "[cyan]q[/cyan]uit"
         )
@@ -1383,6 +1468,11 @@ async def _workflows_menu(client: GatewayClient):
                         console.print(f"[yellow]Run finished: {status}.[/yellow]")
                     else:
                         console.print("[dim]Run dispatched.[/dim]")
+
+        elif action.startswith("h") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(rows):
+                await _show_runs(client, "/api/workflows", rows[idx], "Workflow")
 
         elif action.startswith("t") and action[1:].isdigit():
             idx = int(action[1:]) - 1
