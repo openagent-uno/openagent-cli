@@ -1636,9 +1636,7 @@ async def _models_menu(client: GatewayClient):
 
     Reads the ``models`` table via /api/models. Each row is shown with
     its surrogate id so toggle/remove operations map unambiguously to
-    the DB even when the same vendor is registered under both
-    frameworks. Pricing for claude-cli rows shows as ``sub`` (Pro/Max
-    subscription, no per-token billing).
+    the DB.
     """
     while True:
         db_models = (await client.rest_get("/api/models")).get("models", []) or []
@@ -1657,12 +1655,9 @@ async def _models_menu(client: GatewayClient):
             status = "[green]enabled[/green]" if m.get("enabled") else "[red]disabled[/red]"
             router = "[magenta]yes[/magenta]" if m.get("is_classifier") else ""
             fw = str(m.get("framework", "agno"))
-            if fw == "claude-cli":
-                cost = "[dim]sub[/dim]"
-            else:
-                in_c = m.get("input_cost_per_million")
-                out_c = m.get("output_cost_per_million")
-                cost = f"{in_c or '-'} / {out_c or '-'}"
+            in_c = m.get("input_cost_per_million")
+            out_c = m.get("output_cost_per_million")
+            cost = f"{in_c or '-'} / {out_c or '-'}"
             tier = str(m.get("tier_hint") or "")
             if len(tier) > 32:
                 tier = tier[:31] + "…"
@@ -1892,12 +1887,10 @@ async def _providers_menu(client: GatewayClient):
             name = Prompt.ask("Provider name (e.g. openai, anthropic, zai)").strip()
             framework = Prompt.ask(
                 "Framework",
-                choices=["agno", "claude-cli"],
-                default="claude-cli" if name == "anthropic" else "agno",
+                choices=["agno"],
+                default="agno",
             )
-            api_key = ""
-            if framework == "agno":
-                api_key = Prompt.ask("API key").strip()
+            api_key = Prompt.ask("API key").strip()
             base_url = Prompt.ask("Base URL (optional)").strip()
             payload: dict[str, Any] = {"name": name, "framework": framework}
             if api_key:
@@ -2052,56 +2045,6 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
     response = await client.send_message(msg, session_id, on_status=on_status)
     console.print("\r" + " " * 80 + "\r", end="")
     await _render_response(response, client=client)
-
-
-@cli.command("setup-claude")
-@click.option("--login", is_flag=True, help="Launch claude auth login after check/install")
-@click.option("--email", default=None, help="Pre-fill email for login")
-@click.option("--sso", is_flag=True, help="Use SSO for login")
-@click.option("--no-install", is_flag=True, help="Skip auto-install, only check status")
-def setup_claude_cmd(login: bool, email: str | None, sso: bool, no_install: bool):
-    """Check and optionally install the Claude Code CLI, then launch auth."""
-    try:
-        from openagent.models.claude_install import (
-            find_claude_binary,
-            ensure_claude_binary,
-            check_claude_auth,
-            launch_claude_login,
-        )
-    except ImportError:
-        console.print("[red]Claude setup requires the openagent package.[/red]")
-        return
-
-    binary = find_claude_binary()
-    if binary is None:
-        console.print("[yellow]Claude Code CLI not found.[/yellow]")
-        if no_install:
-            console.print("[dim]Skipping install (--no-install).[/dim]")
-            console.print("[dim]Install manually: curl -fsSL https://claude.ai/install.sh | bash[/dim]")
-            return
-        console.print("[dim]Attempting auto-install…[/dim]")
-        binary = ensure_claude_binary()
-        if binary is None:
-            console.print("[red]Auto-install failed.[/red]")
-            console.print("[dim]Install manually: curl -fsSL https://claude.ai/install.sh | bash[/dim]")
-            return
-        console.print(f"[green]Claude Code installed: {binary}[/green]")
-    else:
-        console.print(f"[dim]Binary: {binary}[/dim]")
-
-    auth = check_claude_auth(binary_path=binary)
-    if auth.logged_in:
-        console.print(f"[green]Logged in as: {auth.email or auth.account_type or 'unknown'}[/green]")
-    else:
-        console.print("[yellow]Not authenticated.[/yellow]")
-
-    if login:
-        proc = launch_claude_login(email=email, sso=sso, binary_path=binary)
-        if proc is None:
-            console.print("[red]Failed to launch claude auth login[/red]")
-        else:
-            console.print("[green]Browser launched for OAuth login.[/green]")
-            console.print("[dim]Run 'openagent-cli setup-claude' again to check status.[/dim]")
 
 
 def main():

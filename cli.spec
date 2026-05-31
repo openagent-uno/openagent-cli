@@ -80,7 +80,6 @@ a = Analysis(
         "openagent",
         "litellm",
         "mcp",
-        "claude_agent_sdk",
         "agno",
         "openai",
         "anthropic",
