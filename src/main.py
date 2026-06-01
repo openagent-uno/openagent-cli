@@ -24,7 +24,12 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from src.client import GatewayClient
+from src.client import (
+    GatewayClient,
+    TERMINAL_OUTPUT,
+    TERMINAL_EXIT,
+    TERMINAL_ERROR,
+)
 
 console = Console()
 
@@ -148,6 +153,7 @@ def _print_help() -> None:
         ("/usage", "Show monthly spend & budget"),
         ("/vault", "Browse, search, edit notes"),
         ("/mcps", "List & toggle MCP servers"),
+        ("/terminal, /shell", "Open an interactive terminal on the agent host (SSH-like)"),
         ("/models", "List providers & switch active model"),
         ("/providers", "List, test, add providers"),
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
@@ -775,6 +781,188 @@ async def _run_invite_cli(handle: str | None, network_name: str | None,
         await client.close()
 
 
+# ── Interactive terminal (PTY over the gateway — like SSH) ───────────────
+
+
+@cli.command("terminal")
+@click.option("--network", "network_name", default=None,
+              help="Which network's agent to open a terminal on (default: active)")
+@click.option("--password", default=None,
+              help="Password (omit to be prompted only if the cached cert is stale).")
+@click.option("--shell", "shell_path", default=None,
+              help="Shell to launch (default: the server's $SHELL).")
+@click.option("--cwd", default=None,
+              help="Initial working directory on the server host.")
+def terminal_cmd(network_name: str | None, password: str | None,
+                 shell_path: str | None, cwd: str | None):
+    """Open an interactive terminal on the agent's host — like an SSH shell.
+
+    Spawns a real PTY on the machine running the OpenAgent server and
+    bridges it to your local terminal: full-screen apps (vim, htop, top,
+    REPLs) work exactly as they would over SSH. Type ``exit`` to end the
+    shell, or press Ctrl-] to detach and leave it for the server to reap.
+    """
+    asyncio.run(_run_terminal_cli(network_name, password, shell_path, cwd))
+
+
+async def _run_terminal_cli(network_name: str | None, password: str | None,
+                            shell_path: str | None, cwd: str | None):
+    client, net = await _open_gateway_for_rest(network_name, password)
+    if client is None:
+        return
+    try:
+        agent = client.target_handle or net.name
+        console.print(
+            f"[green]Terminal[/green] on [cyan]{agent}[/cyan] — "
+            "[dim]Ctrl-] to detach, or type 'exit' to close the shell.[/dim]"
+        )
+        await _run_terminal(client, shell=shell_path, cwd=cwd)
+    finally:
+        await client.disconnect()
+
+
+async def _run_terminal(
+    client: GatewayClient, *, shell: str | None = None, cwd: str | None = None,
+) -> None:
+    """Bridge the local TTY to a gateway PTY in raw mode.
+
+    Local stdin is put in raw mode and every byte is forwarded to the
+    remote PTY (so Ctrl-C interrupts the *remote* foreground job, not
+    this client); remote output bytes are written straight to stdout to
+    preserve colour and cursor control. The escape hatch is Ctrl-] —
+    it detaches locally without killing the shell. SIGWINCH is mirrored
+    to the remote so resizing the window reflows full-screen apps.
+    """
+    import base64
+    import shutil
+    import uuid
+
+    if os.name != "posix":
+        console.print("[red]The terminal command needs a POSIX terminal (macOS/Linux).[/red]")
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[red]The terminal command needs an interactive TTY (not a pipe).[/red]")
+        return
+
+    import signal as _signal
+    import termios
+    import tty
+
+    terminal_id = uuid.uuid4().hex[:16]
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
+    meta: dict[str, Any] = {}
+
+    def term_size() -> tuple[int, int]:
+        sz = shutil.get_terminal_size(fallback=(80, 24))
+        return sz.columns, sz.lines
+
+    def on_frame(frame: dict) -> None:
+        t = frame.get("type")
+        if t == TERMINAL_OUTPUT:
+            try:
+                payload = base64.b64decode(frame.get("data") or "")
+            except Exception:  # noqa: BLE001
+                return
+            # Loop until every byte lands — a single os.write can short-
+            # write a large burst even on a blocking stdout.
+            while payload:
+                try:
+                    n = os.write(stdout_fd, payload)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    break
+                payload = payload[n:]
+        elif t == TERMINAL_EXIT:
+            meta["exit_code"] = frame.get("exit_code")
+            meta["signal"] = frame.get("signal")
+            done.set()
+        elif t == TERMINAL_ERROR:
+            meta["error"] = frame.get("error")
+            done.set()
+        # TERMINAL_READY: nothing to do — the prompt arrives as output.
+
+    DETACH = 0x1D  # Ctrl-]
+
+    def on_stdin() -> None:
+        try:
+            data = os.read(stdin_fd, 4096)
+        except OSError:
+            return
+        if not data:
+            return
+        if DETACH in data:
+            meta["detached"] = True
+            done.set()
+            return
+        asyncio.ensure_future(client.send_terminal_input(terminal_id, data))
+
+    def on_winch() -> None:
+        cols, rows = term_size()
+        asyncio.ensure_future(client.send_terminal_resize(terminal_id, cols, rows))
+
+    client.set_terminal_handler(on_frame)
+    old_attrs = termios.tcgetattr(stdin_fd)
+    reader_added = False
+    winch_added = False
+    try:
+        cols, rows = term_size()
+        await client.send_terminal_open(
+            terminal_id, cols=cols, rows=rows, cwd=cwd, shell=shell,
+        )
+        tty.setraw(stdin_fd)
+        loop.add_reader(stdin_fd, on_stdin)
+        reader_added = True
+        try:
+            loop.add_signal_handler(_signal.SIGWINCH, on_winch)
+            winch_added = True
+        except (NotImplementedError, ValueError):
+            pass
+        # Wait for the shell to end (or a detach), but wake periodically
+        # so a dropped gateway connection doesn't hang the client forever.
+        while not done.is_set():
+            if not client.is_connected:
+                meta.setdefault("error", "connection closed")
+                break
+            try:
+                await asyncio.wait_for(done.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        if reader_added:
+            try:
+                loop.remove_reader(stdin_fd)
+            except (ValueError, OSError):
+                pass
+        if winch_added:
+            try:
+                loop.remove_signal_handler(_signal.SIGWINCH)
+            except (NotImplementedError, ValueError):
+                pass
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+        client.set_terminal_handler(None)
+        # Detach leaves the shell for the server to reap on disconnect;
+        # an explicit close is courteous so it doesn't linger.
+        if meta.get("detached"):
+            try:
+                await client.send_terminal_close(terminal_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Back in cooked mode — print a one-line epilogue.
+    if meta.get("error"):
+        console.print(f"\n[red]Terminal error: {meta['error']}[/red]")
+    elif meta.get("detached"):
+        console.print("\n[dim]Detached. The shell keeps running on the server until you disconnect.[/dim]")
+    elif meta.get("signal"):
+        console.print(f"\n[dim]Terminal exited (signal {meta['signal']}).[/dim]")
+    else:
+        console.print(f"\n[dim]Terminal exited (code {meta.get('exit_code')}).[/dim]")
+
+
 async def _interactive_loop(client: GatewayClient, *, network_name: str, handle: str):
     """Drop-in for the legacy ``_interactive`` body — runs the REPL."""
     target = client.target_handle or "agent"
@@ -935,6 +1123,13 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
 
         if text == "/mcps":
             await _mcps_menu(client)
+            continue
+
+        if text in ("/terminal", "/shell"):
+            console.print(
+                "[dim]Opening terminal — Ctrl-] to detach, type 'exit' to close.[/dim]"
+            )
+            await _run_terminal(client)
             continue
 
         if text in ("/models", "/model"):

@@ -31,6 +31,25 @@ from openagent.stream.wire import event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
 
+# Terminal protocol frame types — mirror ``src/gateway/protocol.py`` on
+# the server. Defined locally rather than imported from
+# ``openagent.gateway.protocol`` so the CLI keeps working against any
+# gateway snapshot, including one predating the interactive-terminal
+# protocol (it'll simply get a ``terminal_error`` back instead of an
+# ``AttributeError`` at import time).
+TERMINAL_OPEN = "terminal_open"
+TERMINAL_INPUT = "terminal_input"
+TERMINAL_RESIZE = "terminal_resize"
+TERMINAL_SIGNAL = "terminal_signal"
+TERMINAL_CLOSE = "terminal_close"
+TERMINAL_READY = "terminal_ready"
+TERMINAL_OUTPUT = "terminal_output"
+TERMINAL_EXIT = "terminal_exit"
+TERMINAL_ERROR = "terminal_error"
+_TERMINAL_FRAMES = frozenset({
+    TERMINAL_READY, TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR,
+})
+
 
 class GatewayClient:
     """Async WebSocket client to an OpenAgent Gateway."""
@@ -69,6 +88,10 @@ class GatewayClient:
         self._command_future: asyncio.Future | None = None
         self._opened_sessions: set[str] = set()
         self._status_cb: dict[str, Callable] = {}
+        # Single sink for terminal frames (terminal_output / _ready /
+        # _exit / _error). The ``terminal`` command installs one while
+        # it owns the foreground; ``None`` the rest of the time.
+        self._terminal_cb: Callable[[dict], None] | None = None
         self._listener_task: asyncio.Task | None = None
         self.agent_name: str | None = None
         self.agent_version: str | None = None
@@ -198,6 +221,11 @@ class GatewayClient:
     def base_url(self) -> str:
         return self.url.replace("ws://", "http://").replace("/ws", "")
 
+    @property
+    def is_connected(self) -> bool:
+        """True while the underlying websocket is open."""
+        return self._ws is not None and not self._ws.closed
+
     async def connect(self) -> None:
         self._session = aiohttp.ClientSession()
         self._ws = await self._session.ws_connect(self.url)
@@ -244,6 +272,18 @@ class GatewayClient:
                 break
             data = json.loads(msg.data)
             t = data.get("type")
+
+            # Terminal frames are routed to the active terminal sink and
+            # never touch the chat stream collectors.
+            if t in _TERMINAL_FRAMES:
+                cb = self._terminal_cb
+                if cb is not None:
+                    try:
+                        cb(data)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("terminal handler error", exc_info=True)
+                continue
+
             sid = data.get("session_id")
             collector = self._stream_pending.get(sid) if sid else None
 
@@ -375,6 +415,64 @@ class GatewayClient:
             session_id=session_id, ts_ms=now_ms(),
             reason=reason,  # type: ignore[arg-type]
         )))
+
+    # ── Interactive terminal helpers ────────────────────────────────
+
+    def set_terminal_handler(self, cb: Callable[[dict], None] | None) -> None:
+        """Install (or clear) the sink for inbound terminal frames."""
+        self._terminal_cb = cb
+
+    async def send_terminal_open(
+        self,
+        terminal_id: str,
+        *,
+        cols: int,
+        rows: int,
+        cwd: str | None = None,
+        shell: str | None = None,
+    ) -> None:
+        payload = {
+            "type": TERMINAL_OPEN,
+            "terminal_id": terminal_id,
+            "cols": int(cols),
+            "rows": int(rows),
+        }
+        if cwd:
+            payload["cwd"] = cwd
+        if shell:
+            payload["shell"] = shell
+        await self._ws.send_json(payload)
+
+    async def send_terminal_input(self, terminal_id: str, data: bytes) -> None:
+        import base64
+        await self._ws.send_json({
+            "type": TERMINAL_INPUT,
+            "terminal_id": terminal_id,
+            "data": base64.b64encode(data).decode("ascii"),
+        })
+
+    async def send_terminal_resize(
+        self, terminal_id: str, cols: int, rows: int
+    ) -> None:
+        await self._ws.send_json({
+            "type": TERMINAL_RESIZE,
+            "terminal_id": terminal_id,
+            "cols": int(cols),
+            "rows": int(rows),
+        })
+
+    async def send_terminal_signal(self, terminal_id: str, signal_name: str) -> None:
+        await self._ws.send_json({
+            "type": TERMINAL_SIGNAL,
+            "terminal_id": terminal_id,
+            "signal": signal_name,
+        })
+
+    async def send_terminal_close(self, terminal_id: str) -> None:
+        await self._ws.send_json({
+            "type": TERMINAL_CLOSE,
+            "terminal_id": terminal_id,
+        })
 
     # REST helpers
     async def rest_get(self, path: str) -> dict:
