@@ -1176,11 +1176,35 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
 
 # ── Vault menu ───────────────────────────────────────────────────────────
 
+def _print_write_result(res: dict, path: str, verb: str = "Saved") -> None:
+    """Print a vault write result, surfacing the new ``warnings`` and
+    ``commit`` fields the server returns (validate-on-write + git history)."""
+    if not res.get("ok"):
+        console.print(f"[red]{verb} failed: {res}[/red]")
+        return
+    line = f"[green]{verb} {path}[/green]"
+    commit = res.get("commit")
+    if commit:
+        line += f" [dim](committed {str(commit)[:8]})[/dim]"
+    console.print(line)
+    for w in (res.get("warnings") or []):
+        sev = w.get("severity", "warn")
+        color = "red" if sev == "error" else "yellow"
+        console.print(f"  [{color}]⚠ {w.get('rule')}: {w.get('message')}[/{color}]")
+
+
 async def _vault_menu(client: GatewayClient):
-    """Interactive vault browser with search and edit."""
+    """Interactive vault browser with search, edit, gate, history, and a
+    link-safe rename."""
     while True:
-        console.print("\n[bold]Vault[/bold] — [cyan]l[/cyan]ist, [cyan]s[/cyan]earch, [cyan]e[/cyan]dit, [cyan]n[/cyan]ew, [cyan]d[/cyan]elete, [cyan]q[/cyan]uit")
-        action = Prompt.ask("Action", choices=["l", "s", "e", "n", "d", "q"], default="l")
+        console.print(
+            "\n[bold]Vault[/bold] — [cyan]l[/cyan]ist, [cyan]s[/cyan]earch, "
+            "[cyan]e[/cyan]dit, [cyan]n[/cyan]ew, [cyan]m[/cyan]ove/rename, "
+            "[cyan]g[/cyan]ate, [cyan]h[/cyan]istory, [cyan]d[/cyan]elete, "
+            "[cyan]q[/cyan]uit")
+        action = Prompt.ask(
+            "Action", choices=["l", "s", "e", "n", "m", "g", "h", "d", "q"],
+            default="l")
         if action == "q":
             return
 
@@ -1207,10 +1231,13 @@ async def _vault_menu(client: GatewayClient):
             if new_text is None:
                 continue
             res = await client.rest_put(f"/api/vault/notes/{path}", {"content": new_text})
-            if res.get("ok"):
-                console.print(f"[green]Created {path}[/green]")
-            else:
-                console.print(f"[red]Failed: {res}[/red]")
+            _print_write_result(res, path, verb="Created")
+        elif action == "m":
+            await _vault_move(client)
+        elif action == "g":
+            await _vault_gate(client)
+        elif action == "h":
+            await _vault_history(client)
         elif action == "d":
             path = Prompt.ask("Note path to delete").strip()
             if not path:
@@ -1275,10 +1302,65 @@ async def _vault_edit(client: GatewayClient, path: str):
     if new_text is None:
         return
     res = await client.rest_put(f"/api/vault/notes/{path}", {"content": new_text})
-    if res.get("ok"):
-        console.print(f"[green]Saved {path}[/green]")
-    else:
-        console.print(f"[red]Save failed: {res}[/red]")
+    _print_write_result(res, path, verb="Saved")
+
+
+async def _vault_move(client: GatewayClient):
+    """Rename/move a note or folder — the server rewrites every inbound
+    [[wikilink]] so nothing breaks (uses POST /api/vault/move, NOT
+    delete+create)."""
+    old = Prompt.ask("Move from (note or folder path)").strip()
+    new = Prompt.ask("Move to").strip()
+    if not old or not new:
+        return
+    res = await client.rest_post("/api/vault/move", {"from": old, "to": new})
+    if res.get("error"):
+        console.print(f"[red]{res['error']}[/red]")
+        return
+    commit = res.get("commit")
+    suffix = f" [dim](committed {str(commit)[:8]})[/dim]" if commit else ""
+    console.print(
+        f"[green]Moved {res.get('notes_moved', '?')} note(s); rewrote "
+        f"{res.get('links_rewritten', 0)} link(s) across "
+        f"{res.get('notes_updated', 0)} note(s).[/green]{suffix}")
+
+
+async def _vault_gate(client: GatewayClient):
+    """Run the quality gate and show the report."""
+    rep = await client.rest_get("/api/vault/gate")
+    ok = rep.get("ok")
+    color = "green" if ok else "red"
+    console.print(
+        f"[{color}]{rep.get('error_count', 0)} errors, "
+        f"{rep.get('warn_count', 0)} warnings, {rep.get('info_count', 0)} info "
+        f"across {rep.get('note_count', 0)} notes[/{color}]")
+    by_rule = rep.get("by_rule") or {}
+    for rule in sorted(by_rule):
+        console.print(f"  [dim]{rule}[/dim]: {len(by_rule[rule])}")
+
+
+async def _vault_history(client: GatewayClient):
+    """Show the vault's git history with provenance (who made each change)."""
+    data = await client.rest_get("/api/vault/history?limit=25")
+    commits = data.get("commits", [])
+    if not commits:
+        console.print("[dim]No history (git tracking may be disabled).[/dim]")
+        return
+    table = Table(title="Vault history")
+    table.add_column("Commit", style="dim", width=9)
+    table.add_column("Change")
+    table.add_column("By", style="cyan")
+    table.add_column("When", style="dim")
+    for c in commits:
+        prov = c.get("provenance") or {}
+        who = prov.get("origin", "")
+        for k in ("session", "workflow", "task", "tool"):
+            if prov.get(k):
+                who += f" {prov[k]}"
+                break
+        table.add_row(c.get("hash", ""), c.get("subject", ""),
+                      who.strip(), (c.get("date", "") or "")[:10])
+    console.print(table)
 
 
 # ── Config / settings ────────────────────────────────────────────────────
