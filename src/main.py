@@ -1339,28 +1339,119 @@ async def _vault_gate(client: GatewayClient):
         console.print(f"  [dim]{rule}[/dim]: {len(by_rule[rule])}")
 
 
+def _provenance_who(prov: dict) -> str:
+    who = prov.get("origin", "")
+    for k in ("session", "workflow", "task", "tool"):
+        if prov.get(k):
+            who += f" {prov[k]}"
+            break
+    return who.strip()
+
+
 async def _vault_history(client: GatewayClient):
-    """Show the vault's git history with provenance (who made each change)."""
+    """Vault git history with provenance — inspect a commit's changes, then
+    optionally restore the vault to that state or reset to it."""
     data = await client.rest_get("/api/vault/history?limit=25")
     commits = data.get("commits", [])
     if not commits:
         console.print("[dim]No history (git tracking may be disabled).[/dim]")
         return
     table = Table(title="Vault history")
+    table.add_column("#", width=3)
     table.add_column("Commit", style="dim", width=9)
     table.add_column("Change")
     table.add_column("By", style="cyan")
     table.add_column("When", style="dim")
-    for c in commits:
-        prov = c.get("provenance") or {}
-        who = prov.get("origin", "")
-        for k in ("session", "workflow", "task", "tool"):
-            if prov.get(k):
-                who += f" {prov[k]}"
-                break
-        table.add_row(c.get("hash", ""), c.get("subject", ""),
-                      who.strip(), (c.get("date", "") or "")[:10])
+    for i, c in enumerate(commits):
+        table.add_row(str(i + 1), c.get("hash", ""), c.get("subject", ""),
+                      _provenance_who(c.get("provenance") or {}),
+                      (c.get("date", "") or "")[:10])
     console.print(table)
+    choice = Prompt.ask(
+        "Inspect # (view changes / restore / reset), or 'q'", default="q")
+    choice = choice.strip().lower()
+    if choice in ("q", ""):
+        return
+    try:
+        commit = commits[int(choice) - 1]
+    except (ValueError, IndexError):
+        console.print("[red]Invalid selection[/red]")
+        return
+    await _vault_commit_detail(client, commit)
+
+
+def _print_diff(diff: str) -> None:
+    """Print a unified diff with +/- colouring (markup disabled so diff
+    content like ``[[wikilinks]]`` isn't parsed as rich markup)."""
+    for line in diff.splitlines():
+        style = "dim"
+        if line.startswith("+") and not line.startswith("+++"):
+            style = "green"
+        elif line.startswith("-") and not line.startswith("---"):
+            style = "red"
+        elif line.startswith("@@"):
+            style = "cyan"
+        console.print(line, style=style, markup=False, highlight=False)
+
+
+async def _vault_commit_detail(client: GatewayClient, commit: dict):
+    """Show a commit's changes (files + diff) and offer restore / reset."""
+    h = commit.get("hash", "")
+    det = await client.rest_get(f"/api/vault/commit?hash={h}")
+    if det.get("error"):
+        console.print(f"[red]{det['error']}[/red]")
+        return
+    console.print(
+        f"\n[bold]{det.get('subject', '')}[/bold]  [dim]{det.get('hash', '')} · "
+        f"{(det.get('date', '') or '')[:19]} · {det.get('author', '')}[/dim]")
+    prov = det.get("provenance") or {}
+    if prov:
+        console.print(f"[dim]by {_provenance_who(prov) or 'system'}[/dim]")
+    for f in det.get("files", []):
+        console.print(f"  [yellow]{f.get('status', '?')}[/yellow] {f.get('path', '')}")
+    if det.get("diff"):
+        console.print()
+        _print_diff(det["diff"])
+        if det.get("diff_truncated"):
+            console.print("[dim]… diff truncated[/dim]")
+
+    console.print(
+        "\n[bold]Actions[/bold] — [cyan]r[/cyan]estore this state "
+        "(safe: adds a commit, keeps history), rese[cyan]t[/cyan] to here "
+        "([red]DESTRUCTIVE[/red]: deletes every later commit), [cyan]q[/cyan]uit")
+    act = Prompt.ask("Action", choices=["r", "t", "q"], default="q")
+    if act == "r":
+        if not Confirm.ask(
+                f"Restore the vault to the state at {h[:8]}? "
+                "(adds a new commit; history is kept)", default=False):
+            return
+        res = await client.rest_post("/api/vault/restore", {"hash": h})
+        if res.get("error"):
+            console.print(f"[red]{res['error']}[/red]")
+        elif res.get("changed"):
+            console.print(
+                f"[green]Restored to {h[:8]} "
+                f"(new commit {str(res.get('commit') or '')[:8]}).[/green]")
+        else:
+            console.print("[dim]Vault already at that state — nothing to do.[/dim]")
+    elif act == "t":
+        console.print(
+            f"[red]⚠ This permanently deletes every commit AFTER {h[:8]}. "
+            "It cannot be undone from the app.[/red]")
+        if not Confirm.ask("Proceed?", default=False):
+            return
+        typed = Prompt.ask(f"Type the short hash [bold]{h[:8]}[/bold] to confirm")
+        if typed.strip() != h[:8]:
+            console.print("[dim]Hash mismatch — aborted.[/dim]")
+            return
+        res = await client.rest_post(
+            "/api/vault/reset", {"hash": h, "confirm": True})
+        if res.get("error"):
+            console.print(f"[red]{res['error']}[/red]")
+        else:
+            console.print(
+                f"[green]Reset to {h[:8]} — deleted "
+                f"{res.get('deleted', 0)} later commit(s).[/green]")
 
 
 # ── Config / settings ────────────────────────────────────────────────────
