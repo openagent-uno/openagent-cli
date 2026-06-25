@@ -1177,16 +1177,25 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
 # ── Vault menu ───────────────────────────────────────────────────────────
 
 def _print_write_result(res: dict, path: str, verb: str = "Saved") -> None:
-    """Print a vault write result, surfacing the new ``warnings`` and
-    ``commit`` fields the server returns (validate-on-write + git history)."""
-    if not res.get("ok"):
-        console.print(f"[red]{verb} failed: {res}[/red]")
+    """Print a vault write result, surfacing the quality gate: a rejected
+    write (``blocked``) with its errors, the fields it auto-fixed
+    (``applied``), warnings, and the git commit."""
+    if res.get("blocked") or res.get("ok") is False:
+        console.print(
+            f"[red]✕ {path} rejected by the vault quality gate — not saved:[/red]")
+        for e in (res.get("errors") or []):
+            console.print(f"  [red]- {e.get('rule')}: {e.get('message')}[/red]")
+        for w in (res.get("warnings") or []):
+            console.print(f"  [yellow]⚠ {w.get('rule')}: {w.get('message')}[/yellow]")
+        console.print("[dim]Fix the above and save again.[/dim]")
         return
     line = f"[green]{verb} {path}[/green]"
     commit = res.get("commit")
     if commit:
         line += f" [dim](committed {str(commit)[:8]})[/dim]"
     console.print(line)
+    for a in (res.get("applied") or []):
+        console.print(f"  [dim]✓ auto-fixed: {a}[/dim]")
     for w in (res.get("warnings") or []):
         sev = w.get("severity", "warn")
         color = "red" if sev == "error" else "yellow"
