@@ -1687,6 +1687,7 @@ async def _tasks_menu(client: GatewayClient):
         table.add_column("Name", style="cyan")
         table.add_column("Cron")
         table.add_column("On", width=3)
+        table.add_column("Live", width=4)
         table.add_column("Prompt", max_width=50)
         for i, t in enumerate(tasks):
             table.add_row(
@@ -1694,10 +1695,11 @@ async def _tasks_menu(client: GatewayClient):
                 t.get("name", "?"),
                 t.get("cron_expression", "?"),
                 "✓" if t.get("enabled") else "—",
+                "[green]▶[/green]" if t.get("running") else "—",
                 (t.get("prompt", ""))[:50],
             )
         console.print(table)
-        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]h[/cyan]istory #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle #, [cyan]q[/cyan]uit")
+        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]r[/cyan]un #, [cyan]s[/cyan]top #, [cyan]h[/cyan]istory #, [cyan]d[/cyan]elete #, [cyan]t[/cyan]oggle #, [cyan]q[/cyan]uit")
         action = Prompt.ask("Action", default="q")
         action = action.strip().lower()
 
@@ -1735,6 +1737,48 @@ async def _tasks_menu(client: GatewayClient):
                     console.print(f"[red]{res['error']}[/red]")
                 else:
                     console.print("[green]Saved.[/green]")
+
+        elif action.startswith("r") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(tasks):
+                t = tasks[idx]
+                console.print(
+                    f"[dim]Running '{t.get('name')}' now (wait up to 5 min)…[/dim]"
+                )
+                res = await client.rest_post(
+                    f"/api/scheduled-tasks/{t['id']}/run",
+                    {"wait": True, "timeout_s": 300},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    status = res.get("status") if isinstance(res, dict) else None
+                    if status == "success":
+                        console.print("[green]Run finished: success.[/green]")
+                    elif status:
+                        console.print(f"[yellow]Run finished: {status}.[/yellow]")
+                    else:
+                        console.print("[dim]Run dispatched.[/dim]")
+
+        elif action.startswith("s") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(tasks):
+                t = tasks[idx]
+                console.print(
+                    f"[dim]Stopping running firing(s) of '{t.get('name')}'…[/dim]"
+                )
+                res = await client.rest_post(
+                    f"/api/scheduled-tasks/{t['id']}/stop",
+                    {"wait": True, "timeout_s": 30},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    count = res.get("count", 0) if isinstance(res, dict) else 0
+                    if count:
+                        console.print(f"[green]Stopped {count} firing(s).[/green]")
+                    else:
+                        console.print("[dim]Nothing was running.[/dim]")
 
         elif action.startswith("h") and action[1:].isdigit():
             idx = int(action[1:]) - 1
