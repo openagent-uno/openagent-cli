@@ -19,10 +19,13 @@ from typing import Any
 
 import click
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+from rich.spinner import Spinner
 from rich.table import Table
+from rich.text import Text
 
 from src.client import (
     GatewayClient,
@@ -110,6 +113,47 @@ async def _render_response(response: dict, client: "GatewayClient | None" = None
             except Exception as e:  # noqa: BLE001 — inform user of any fetch failure, keep loop alive
                 console.print(f"  {icon} [red]{filename}[/red] [dim](download failed: {e})[/dim]")
     console.print()
+
+
+async def _send_message_with_indicator(
+    client: "GatewayClient", text: str, session_id: str
+) -> None:
+    """Send a chat turn while showing an animated "Reasoning…" spinner,
+    then render the response.
+
+    The spinner is driven by the server's transient ``reasoning`` frames
+    (via ``on_reasoning``): it animates while the agent is thinking with
+    no visible output yet, and collapses the moment output starts or the
+    turn ends. Tool steps (``on_status``) are printed as persistent lines
+    above the spinner so the step trail survives the turn. The spinner is
+    rendered in a ``transient`` ``Live`` region so it is fully erased — and
+    the prompt left intact — before the response prints, even on error.
+    """
+    spinner = Spinner("dots", text="[dim]Reasoning…[/dim]")
+    idle = Text("")  # collapses the Live region (active=false / between steps)
+
+    # ``Live`` auto-refreshes on its own thread, so the spinner animates
+    # while ``send_message`` is awaited and the WS callbacks fire on the
+    # event loop — neither blocks the other.
+    with Live(idle, console=console, refresh_per_second=12, transient=True) as live:
+        async def on_reasoning(active: bool) -> None:
+            live.update(spinner if active else idle)
+
+        async def on_status(status: str) -> None:
+            # Tool-status text is untrusted (tool names, error strings, paths
+            # with brackets) — feed it as a styled Text, never as a markup
+            # string, so a stray ``[/x]`` can't raise MarkupError or silently
+            # drop the rest of the line.
+            live.console.print(Text(format_tool_status(status), style="dim"))
+
+        try:
+            response = await client.send_message(
+                text, session_id, on_status=on_status, on_reasoning=on_reasoning,
+            )
+        finally:
+            live.update(idle)
+
+    await _render_response(response, client=client)
 
 
 def _open_in_editor(initial_text: str, suffix: str = ".md") -> str | None:
@@ -1160,15 +1204,7 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             continue
 
         # ── Chat message ──
-        console.print("[dim]⏳ Thinking...[/dim]", end="")
-
-        async def on_status(status: str):
-            line = format_tool_status(status)
-            console.print(f"\r[dim]⏳ {line}[/dim]" + " " * 20, end="")
-
-        response = await client.send_message(text, active, on_status=on_status)
-        console.print("\r" + " " * 80 + "\r", end="")
-        await _render_response(response, client=client)
+        await _send_message_with_indicator(client, text, active)
 
     await client.disconnect()
     console.print("[dim]Disconnected.[/dim]")
@@ -2459,13 +2495,7 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
         + f"\nUse the Read tool to inspect {inspect}."
     )
 
-    async def on_status(s):
-        line = format_tool_status(s)
-        console.print(f"\r[dim]⏳ {line}[/dim]" + " " * 20, end="")
-
-    response = await client.send_message(msg, session_id, on_status=on_status)
-    console.print("\r" + " " * 80 + "\r", end="")
-    await _render_response(response, client=client)
+    await _send_message_with_indicator(client, msg, session_id)
 
 
 def main():

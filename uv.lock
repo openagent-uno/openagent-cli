@@ -599,7 +599,7 @@ wheels = [
 
 [[package]]
 name = "openagent-cli"
-version = "0.13.8"
+version = "0.13.20"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

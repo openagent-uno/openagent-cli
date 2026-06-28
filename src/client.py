@@ -88,6 +88,10 @@ class GatewayClient:
         self._command_future: asyncio.Future | None = None
         self._opened_sessions: set[str] = set()
         self._status_cb: dict[str, Callable] = {}
+        # Per-session sink for the transient ``reasoning`` frame
+        # ({"type":"reasoning","active":bool,...}). Keyed by session_id
+        # like ``_status_cb``; the callback receives the bool ``active``.
+        self._reasoning_cb: dict[str, Callable] = {}
         # Single sink for terminal frames (terminal_output / _ready /
         # _exit / _error). The ``terminal`` command installs one while
         # it owns the foreground; ``None`` the rest of the time.
@@ -290,7 +294,25 @@ class GatewayClient:
             if t == P.STATUS:
                 cb = self._status_cb.get(sid)
                 if cb is not None:
-                    await cb(data.get("text", ""))
+                    # Guarded like the terminal/reasoning/turn-final sinks
+                    # below: a raising on_status (e.g. a tool-error string
+                    # with Rich markup) must NOT kill the listener — that
+                    # would strand ``collector.done`` and hang the turn.
+                    try:
+                        await cb(data.get("text", ""))
+                    except Exception:  # noqa: BLE001
+                        logger.debug("status handler error", exc_info=True)
+                continue
+            if t == "reasoning":
+                # Transient, session-scoped "is the agent thinking with
+                # no visible output yet?" signal. Route ``active`` to the
+                # per-session reasoning sink; a missing sink is a no-op.
+                rcb = self._reasoning_cb.get(sid)
+                if rcb is not None:
+                    try:
+                        await rcb(bool(data.get("active", False)))
+                    except Exception:  # noqa: BLE001
+                        logger.debug("reasoning handler error", exc_info=True)
                 continue
             if t == P.COMMAND_RESULT:
                 if self._command_future is not None and not self._command_future.done():
@@ -305,6 +327,15 @@ class GatewayClient:
             if evt is None or collector is None:
                 continue
             if fold_outbound_event(collector, evt):
+                # Safety net: clear any lingering reasoning state on the
+                # turn-final frame in case an explicit active=false was
+                # never sent (or was missed).
+                rcb = self._reasoning_cb.get(sid)
+                if rcb is not None:
+                    try:
+                        await rcb(False)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("reasoning handler error", exc_info=True)
                 collector.done.set()
 
     async def send_message(
@@ -314,8 +345,16 @@ class GatewayClient:
         on_status: Callable | None = None,
         *,
         source: str = "user_typed",
+        on_reasoning: Callable | None = None,
     ) -> dict:
-        """Push a typed message into the user's stream session and await the reply."""
+        """Push a typed message into the user's stream session and await the reply.
+
+        ``on_reasoning(active: bool)`` — if supplied — is awaited whenever a
+        ``reasoning`` frame arrives for this session (active=true when the
+        agent is thinking with no visible output yet, false once output
+        starts or the turn ends). It is also driven to ``False`` on the
+        turn-final frame as a safety net, then cleared on return.
+        """
         if session_id not in self._opened_sessions:
             await self._ws.send_json(event_to_wire(SessionOpen(
                 session_id=session_id,
@@ -330,6 +369,8 @@ class GatewayClient:
         self._stream_pending[session_id] = collector
         if on_status:
             self._status_cb[session_id] = on_status
+        if on_reasoning:
+            self._reasoning_cb[session_id] = on_reasoning
 
         try:
             await self._ws.send_json(event_to_wire(TextFinal(
@@ -341,6 +382,7 @@ class GatewayClient:
         except Exception:
             self._stream_pending.pop(session_id, None)
             self._status_cb.pop(session_id, None)
+            self._reasoning_cb.pop(session_id, None)
             raise
 
         try:
@@ -348,6 +390,7 @@ class GatewayClient:
         finally:
             self._stream_pending.pop(session_id, None)
             self._status_cb.pop(session_id, None)
+            self._reasoning_cb.pop(session_id, None)
 
         return collector.to_legacy_reply()
 
