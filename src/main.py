@@ -129,8 +129,14 @@ async def _send_message_with_indicator(
     rendered in a ``transient`` ``Live`` region so it is fully erased — and
     the prompt left intact — before the response prints, even on error.
     """
+    import signal as _signal
+
     spinner = Spinner("dots", text="[dim]Reasoning…[/dim]")
     idle = Text("")  # collapses the Live region (active=false / between steps)
+
+    loop = asyncio.get_running_loop()
+    interrupted = {"v": False}
+    response = None
 
     # ``Live`` auto-refreshes on its own thread, so the spinner animates
     # while ``send_message`` is awaited and the WS callbacks fire on the
@@ -146,14 +152,65 @@ async def _send_message_with_indicator(
             # drop the rest of the line.
             live.console.print(Text(format_tool_status(status), style="dim"))
 
-        try:
-            response = await client.send_message(
+        # Drive the turn as a task so a Ctrl-C mid-turn becomes a
+        # server-side barge-in (stop) instead of tearing the CLI down. The
+        # blocking REPL can't read a typed ``/stop`` while a turn streams,
+        # so Ctrl-C is the only interactive stop the CLI has — make it count.
+        send_task = asyncio.ensure_future(
+            client.send_message(
                 text, session_id, on_status=on_status, on_reasoning=on_reasoning,
             )
+        )
+
+        def _on_sigint() -> None:
+            # First Ctrl-C: ask the server to cancel THIS turn (interrupt
+            # frame → _cancel_active_turn). The turn's terminal frame then
+            # resolves ``send_message`` normally and we drop back to the
+            # prompt. The handler is removed in the finally so a Ctrl-C at
+            # the idle prompt still quits the app.
+            if interrupted["v"]:
+                return
+            interrupted["v"] = True
+            loop.create_task(client.send_interrupt(session_id, reason="manual"))
+
+        # POSIX: install a loop SIGINT handler for the turn's lifetime
+        # (same pattern the terminal bridge uses for SIGWINCH). Windows /
+        # loops without signal support fall back to the KeyboardInterrupt
+        # except below.
+        sigint_installed = False
+        if sys.platform != "win32":
+            try:
+                loop.add_signal_handler(_signal.SIGINT, _on_sigint)
+                sigint_installed = True
+            except (NotImplementedError, RuntimeError, ValueError):
+                sigint_installed = False
+
+        try:
+            response = await send_task
+        except KeyboardInterrupt:
+            # Fallback stop path (no loop signal handler): send the
+            # barge-in, then drain the now-cancelled turn so we stay in
+            # the REPL instead of unwinding out of asyncio.run.
+            interrupted["v"] = True
+            try:
+                await asyncio.shield(
+                    client.send_interrupt(session_id, reason="manual")
+                )
+                response = await send_task
+            except Exception:
+                response = None
         finally:
             live.update(idle)
+            if sigint_installed:
+                try:
+                    loop.remove_signal_handler(_signal.SIGINT)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
 
-    await _render_response(response, client=client)
+    if interrupted["v"]:
+        console.print("[dim]⏹  Interrupted.[/dim]")
+    if response is not None:
+        await _render_response(response, client=client)
 
 
 def _open_in_editor(initial_text: str, suffix: str = ".md") -> str | None:
@@ -1121,6 +1178,12 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
                 continue
             sid = found[0]
             label = sessions[sid]
+            # Deleting a chat also removes the sub-agent sessions it spawned —
+            # warn before the typed-yes confirmation so it's never a surprise.
+            console.print(
+                "[dim]This also deletes any sub-agent sessions this chat "
+                "spawned.[/dim]"
+            )
             confirm = Prompt.ask(
                 f"[yellow]Delete session '{label}'?[/yellow] Type [bold]yes[/bold] to confirm",
             )
@@ -1131,8 +1194,20 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             if active == sid:
                 active = next(iter(sessions), "cli-default")
             try:
-                await client.rest_delete(f"/api/sessions/{sid}")
-                console.print(f"[green]Deleted '{label}'[/green]")
+                res = await client.rest_delete(f"/api/sessions/{sid}")
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    # The server reports how many rows it removed (the chat
+                    # plus any cascaded sub-agents).
+                    count = res.get("deleted_count") if isinstance(res, dict) else None
+                    if isinstance(count, int) and count > 1:
+                        console.print(
+                            f"[green]Deleted '{label}' and {count - 1} "
+                            f"sub-agent session(s)[/green]"
+                        )
+                    else:
+                        console.print(f"[green]Deleted '{label}'[/green]")
             except Exception as e:
                 console.print(f"[yellow]Deleted locally (server cleanup failed: {e})[/yellow]")
             continue
@@ -1192,8 +1267,23 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             await _settings_menu(client)
             continue
 
+        # ── /stop — barge-in the active session's live turn ──
+        # Routes to the stream ``interrupt`` frame (the verb that actually
+        # cancels a StreamSession turn) rather than the legacy COMMAND
+        # ``stop`` that targets an unused queue. Typed ``/stop`` is only
+        # reachable between turns here (the REPL blocks during a turn —
+        # use Ctrl-C to stop mid-stream), so this is mostly a no-op safety
+        # net, but it now hits the correct path.
+        if text == "/stop":
+            try:
+                await client.send_interrupt(active, reason="manual")
+                console.print("[dim]Stop requested.[/dim]")
+            except Exception as e:
+                console.print(f"[red]Command failed: {e}[/red]")
+            continue
+
         # ── Gateway pass-through commands ──
-        # /clear, /restart, /update, /status, /stop, /queue, /reset
+        # /clear, /restart, /update, /status, /queue, /reset
         if text.startswith("/"):
             cmd = text[1:].split()[0]
             try:
