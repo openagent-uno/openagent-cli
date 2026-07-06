@@ -27,12 +27,16 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
-from src.client import (
-    GatewayClient,
-    TERMINAL_OUTPUT,
-    TERMINAL_EXIT,
-    TERMINAL_ERROR,
-)
+# Deferred import: src.client pulls in openagent.gateway.protocol which
+# (in the installed server package) does ``from src.gateway.commands import
+# COMMANDS`` at module level — a ``from src.*`` import that resolves to the
+# CLI's own src/ rather than the server's src/ and therefore blows up.
+# With ``from __future__ import annotations`` already active, every
+# GatewayClient annotation in this file is a lazy string, so no NameError
+# at definition time.  The three actual call sites below import lazily.
+# TERMINAL_* constants used in _run_terminal are also imported there.
+if False:  # TYPE_CHECKING placeholder — satisfies IDEs without importing
+    from src.client import GatewayClient, TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR  # noqa: F401
 
 console = Console()
 
@@ -255,7 +259,9 @@ def _print_help() -> None:
         ("/vault", "Browse, search, edit notes"),
         ("/mcps", "List & toggle MCP servers"),
         ("/terminal, /shell", "Open an interactive terminal on the agent host (SSH-like)"),
-        ("/models", "List providers & switch active model"),
+        ("/compact", "Summarize & compress conversation history to free context"),
+        ("/model [id]", "Show or switch the model for this session (/model default to unpin)"),
+        ("/models", "List providers & switch active model"),  # local interactive menu
         ("/providers", "List, test, add providers"),
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
         ("/tasks", "Manage scheduled tasks + view run history"),
@@ -501,6 +507,7 @@ async def _run_connect(
         raise
 
     try:
+        from src.client import GatewayClient  # lazy: avoids module-level import of openagent.gateway
         client = await GatewayClient.from_network(
             handle=handle,
             network_name=network_name,
@@ -665,6 +672,7 @@ async def _open_gateway_for_rest(network_name: str | None, password: str | None)
     # The cert may be valid (no password needed) or expired (prompt).
     # GatewayClient.from_network handles both branches — we just need
     # to surface the prompt before it raises PermissionError.
+    from src.client import GatewayClient  # lazy: avoids module-level import of openagent.gateway
     try:
         client = await GatewayClient.from_network(
             handle=net.handle, network_name=network_name,
@@ -937,6 +945,7 @@ async def _run_terminal(
     import base64
     import shutil
     import uuid
+    from src.client import TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR  # lazy import
 
     if os.name != "posix":
         console.print("[red]The terminal command needs a POSIX terminal (macOS/Linux).[/red]")
@@ -1283,11 +1292,17 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             continue
 
         # ── Gateway pass-through commands ──
-        # /clear, /restart, /update, /status, /queue, /reset
+        # /clear, /restart, /update, /status, /queue, /reset,
+        # /compact, /model [arg]
         if text.startswith("/"):
-            cmd = text[1:].split()[0]
+            parts = text[1:].split(None, 1)  # split into [cmd, rest] or [cmd]
+            cmd = parts[0]
+            cmd_arg = parts[1] if len(parts) > 1 else None
+            # Session-scoped commands need session_id forwarded
+            session_scoped = {"compact", "model", "clear", "stop", "new", "reset"}
+            sid_for_cmd = active if cmd in session_scoped else None
             try:
-                result = await client.send_command(cmd)
+                result = await client.send_command(cmd, arg=cmd_arg, session_id=sid_for_cmd)
                 console.print(f"[dim]{result}[/dim]")
             except Exception as e:
                 console.print(f"[red]Command failed: {e}[/red]")

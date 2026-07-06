@@ -15,7 +15,6 @@ from typing import Callable
 
 import aiohttp
 
-from openagent.gateway import protocol as P
 from openagent.network import user_store
 from openagent.network.client.session import LoopbackProxy, SessionDialer
 from openagent.network.identity import (
@@ -31,12 +30,21 @@ from openagent.stream.wire import event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
 
-# Terminal protocol frame types — mirror ``src/gateway/protocol.py`` on
-# the server. Defined locally rather than imported from
-# ``openagent.gateway.protocol`` so the CLI keeps working against any
-# gateway snapshot, including one predating the interactive-terminal
-# protocol (it'll simply get a ``terminal_error`` back instead of an
-# ``AttributeError`` at import time).
+# Gateway + terminal protocol frame types — mirroring ``src/gateway/protocol.py``
+# on the server. Defined locally rather than imported from
+# ``openagent.gateway.protocol`` so the CLI keeps working against any gateway
+# snapshot and avoids a circular namespace conflict: the installed
+# openagent.gateway.protocol does ``from src.gateway.commands import COMMANDS``
+# at module level (it expects to run inside the server repo where ``src`` == the
+# server source), which blows up when PYTHONPATH contains the CLI's ``src/``
+# instead.  String literals are the stable contract; no import needed.
+_P_AUTH = "auth"
+_P_AUTH_ERROR = "auth_error"
+_P_COMMAND = "command"
+_P_COMMAND_RESULT = "command_result"
+_P_STATUS = "status"
+_P_ERROR = "error"
+
 TERMINAL_OPEN = "terminal_open"
 TERMINAL_INPUT = "terminal_input"
 TERMINAL_RESIZE = "terminal_resize"
@@ -235,9 +243,9 @@ class GatewayClient:
         self._ws = await self._session.ws_connect(self.url)
         # Legacy AUTH frame is ignored by the new gateway, but sending
         # it costs nothing and keeps wire compatibility tests passing.
-        await self._ws.send_json({"type": P.AUTH, "client_id": "cli"})
+        await self._ws.send_json({"type": _P_AUTH, "client_id": "cli"})
         resp = await self._ws.receive_json()
-        if resp.get("type") == P.AUTH_ERROR:
+        if resp.get("type") == _P_AUTH_ERROR:
             raise ConnectionError(f"Auth failed: {resp.get('reason')}")
         self.agent_name = resp.get("agent_name")
         self.agent_version = resp.get("version")
@@ -291,7 +299,7 @@ class GatewayClient:
             sid = data.get("session_id")
             collector = self._stream_pending.get(sid) if sid else None
 
-            if t == P.STATUS:
+            if t == _P_STATUS:
                 cb = self._status_cb.get(sid)
                 if cb is not None:
                     # Guarded like the terminal/reasoning/turn-final sinks
@@ -314,12 +322,12 @@ class GatewayClient:
                     except Exception:  # noqa: BLE001
                         logger.debug("reasoning handler error", exc_info=True)
                 continue
-            if t == P.COMMAND_RESULT:
+            if t == _P_COMMAND_RESULT:
                 if self._command_future is not None and not self._command_future.done():
                     self._command_future.set_result(data)
                     self._command_future = None
                 continue
-            if t == P.ERROR and collector is None:
+            if t == _P_ERROR and collector is None:
                 logger.warning("gateway error (no session): %s", data.get("text"))
                 continue
 
@@ -394,12 +402,19 @@ class GatewayClient:
 
         return collector.to_legacy_reply()
 
-    async def send_command(self, name: str) -> str:
+    async def send_command(
+        self, name: str, arg: str | None = None, session_id: str | None = None,
+    ) -> str:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         self._command_future = fut
         try:
-            await self._ws.send_json({"type": P.COMMAND, "name": name})
+            payload: dict = {"type": _P_COMMAND, "name": name}
+            if arg is not None:
+                payload["arg"] = arg
+            if session_id is not None:
+                payload["session_id"] = session_id
+            await self._ws.send_json(payload)
             result = await fut
         finally:
             if self._command_future is fut:
