@@ -44,6 +44,7 @@ _P_COMMAND = "command"
 _P_COMMAND_RESULT = "command_result"
 _P_STATUS = "status"
 _P_ERROR = "error"
+_P_SESSION_COMPACTED = "session_compacted"
 
 TERMINAL_OPEN = "terminal_open"
 TERMINAL_INPUT = "terminal_input"
@@ -100,6 +101,11 @@ class GatewayClient:
         # ({"type":"reasoning","active":bool,...}). Keyed by session_id
         # like ``_status_cb``; the callback receives the bool ``active``.
         self._reasoning_cb: dict[str, Callable] = {}
+        # Per-session sink for the ``session_compacted`` frame (vision §2
+        # in-place compaction). Keyed by session_id like the others; the
+        # callback receives the raw frame dict so it can read ``phase`` +
+        # the token/run stats and render a step line.
+        self._compaction_cb: dict[str, Callable] = {}
         # Single sink for terminal frames (terminal_output / _ready /
         # _exit / _error). The ``terminal`` command installs one while
         # it owns the foreground; ``None`` the rest of the time.
@@ -322,6 +328,19 @@ class GatewayClient:
                     except Exception:  # noqa: BLE001
                         logger.debug("reasoning handler error", exc_info=True)
                 continue
+            if t == _P_SESSION_COMPACTED:
+                # In-place compaction progress (vision §2): running →
+                # done/error. Route the raw frame to the per-session sink
+                # so the turn renderer can print a "Compacting…" step line;
+                # a missing sink (e.g. a bare /compact command with no live
+                # turn) is a harmless no-op.
+                ccb = self._compaction_cb.get(sid)
+                if ccb is not None:
+                    try:
+                        await ccb(data)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("compaction handler error", exc_info=True)
+                continue
             if t == _P_COMMAND_RESULT:
                 if self._command_future is not None and not self._command_future.done():
                     self._command_future.set_result(data)
@@ -354,6 +373,7 @@ class GatewayClient:
         *,
         source: str = "user_typed",
         on_reasoning: Callable | None = None,
+        on_compaction: Callable | None = None,
     ) -> dict:
         """Push a typed message into the user's stream session and await the reply.
 
@@ -379,6 +399,8 @@ class GatewayClient:
             self._status_cb[session_id] = on_status
         if on_reasoning:
             self._reasoning_cb[session_id] = on_reasoning
+        if on_compaction:
+            self._compaction_cb[session_id] = on_compaction
 
         try:
             await self._ws.send_json(event_to_wire(TextFinal(
@@ -391,6 +413,7 @@ class GatewayClient:
             self._stream_pending.pop(session_id, None)
             self._status_cb.pop(session_id, None)
             self._reasoning_cb.pop(session_id, None)
+            self._compaction_cb.pop(session_id, None)
             raise
 
         try:
@@ -399,6 +422,7 @@ class GatewayClient:
             self._stream_pending.pop(session_id, None)
             self._status_cb.pop(session_id, None)
             self._reasoning_cb.pop(session_id, None)
+            self._compaction_cb.pop(session_id, None)
 
         return collector.to_legacy_reply()
 

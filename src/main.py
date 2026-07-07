@@ -60,6 +60,25 @@ def format_tool_status(raw: str) -> str:
     return f"✓ {tool} done"
 
 
+def format_compaction(data: dict) -> str | None:
+    """Human line for a ``session_compacted`` frame, or ``None`` to skip.
+
+    In-place compaction (vision §2) fires ``running`` before the fold and
+    ``done`` after it (a rare ``error`` when the summary came back empty).
+    Channels stay sober — just the start and the outcome: ``running``
+    prints "Compacting conversation…", ``done`` prints "Compacted
+    conversation". The run/token detail lives only in the desktop app's
+    expandable card, not here. ``error`` is skipped — nothing landed, and
+    the printed "Compacting…" line simply stays in scrollback.
+    """
+    phase = str(data.get("phase") or "done")
+    if phase == "running":
+        return "🗜 Compacting conversation…"
+    if phase == "error":
+        return None
+    return "🗜 Compacted conversation"
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 async def _render_response(response: dict, client: "GatewayClient | None" = None) -> None:
@@ -156,6 +175,14 @@ async def _send_message_with_indicator(
             # drop the rest of the line.
             live.console.print(Text(format_tool_status(status), style="dim"))
 
+        async def on_compaction(data: dict) -> None:
+            # In-place compaction (vision §2) — a persistent step line above
+            # the spinner, same treatment as a tool step. Untrusted only in
+            # theory (server-built ints), but keep the Text-not-markup habit.
+            line = format_compaction(data)
+            if line:
+                live.console.print(Text(line, style="dim"))
+
         # Drive the turn as a task so a Ctrl-C mid-turn becomes a
         # server-side barge-in (stop) instead of tearing the CLI down. The
         # blocking REPL can't read a typed ``/stop`` while a turn streams,
@@ -163,6 +190,7 @@ async def _send_message_with_indicator(
         send_task = asyncio.ensure_future(
             client.send_message(
                 text, session_id, on_status=on_status, on_reasoning=on_reasoning,
+                on_compaction=on_compaction,
             )
         )
 
@@ -260,8 +288,8 @@ def _print_help() -> None:
         ("/mcps", "List & toggle MCP servers"),
         ("/terminal, /shell", "Open an interactive terminal on the agent host (SSH-like)"),
         ("/compact", "Summarize & compress conversation history to free context"),
-        ("/model [id]", "Show or switch the model for this session (/model default to unpin)"),
-        ("/models", "List providers & switch active model"),  # local interactive menu
+        ("/model [query]", "Pick a model for this session (menu; /model <name> fuzzy-switches, /model default unpins)"),
+        ("/models", "Full model catalog editor (add/toggle/router/pin)"),  # local interactive menu
         ("/providers", "List, test, add providers"),
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
         ("/tasks", "Manage scheduled tasks + view run history"),
@@ -1260,8 +1288,18 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             await _run_terminal(client)
             continue
 
-        if text in ("/models", "/model"):
-            await _models_menu(client)
+        if text == "/models":
+            await _models_menu(client, active)
+            continue
+
+        # ``/model`` opens a focused picker for the ACTIVE session (list
+        # enabled LLMs, pick one to pin, 0 = Auto). ``/model <partial>``
+        # fuzzy-matches — a unique match switches directly, ``/model
+        # default`` clears the pin. This replaces typing the exact
+        # runtime_id by hand.
+        if text == "/model" or text.startswith("/model "):
+            model_arg = text[len("/model"):].strip() or None
+            await _model_quick_pick(client, active, model_arg)
             continue
 
         if text == "/providers":
@@ -1302,6 +1340,14 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             session_scoped = {"compact", "model", "clear", "stop", "new", "reset"}
             sid_for_cmd = active if cmd in session_scoped else None
             try:
+                if cmd == "compact":
+                    # Show the start of the fold before the (blocking) command
+                    # round-trips — the same "Compacting conversation" step the
+                    # automatic path shows; the concise result below is the
+                    # outcome. (The session_compacted frames still drive the
+                    # desktop app's card; a command has no turn to route them
+                    # through here, so we surface the start locally.)
+                    console.print(Text("🗜 Compacting conversation…", style="dim"))
                 result = await client.send_command(cmd, arg=cmd_arg, session_id=sid_for_cmd)
                 console.print(f"[dim]{result}[/dim]")
             except Exception as e:
@@ -2193,12 +2239,113 @@ async def _mcps_menu(client: GatewayClient):
 
 # ── Models ────────────────────────────────────────────────────────────────
 
-async def _models_menu(client: GatewayClient):
+async def _model_pin(client: GatewayClient, session_id: str, m: dict) -> None:
+    try:
+        await client.rest_put(
+            f"/api/sessions/{session_id}/model", {"runtime_id": m["runtime_id"]},
+        )
+        disp = m.get("display_name") or m.get("model") or m["runtime_id"]
+        console.print(f"[green]Switched to {disp} ({m['runtime_id']}) for this session.[/green]")
+    except Exception as e:
+        console.print(
+            f"[red]{e}[/red] [dim](cross-framework pins are rejected — /model default first)[/dim]"
+        )
+
+
+async def _model_unpin(client: GatewayClient, session_id: str) -> None:
+    try:
+        await client.rest_delete(f"/api/sessions/{session_id}/model")
+        console.print("[green]Model pin cleared — SmartRouter will pick the best model.[/green]")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+
+
+async def _model_quick_pick(
+    client: GatewayClient, session_id: str, query: str | None = None,
+) -> None:
+    """Focused ``/model`` picker for the active session.
+
+    Lists enabled LLM models in a numbered table (with the current pin
+    marked and an ``Auto`` / SmartRouter option), then pins the chosen
+    model to ``session_id`` via ``PUT /api/sessions/{id}/model``. When
+    ``query`` is given (``/model <partial>``) it pre-filters by substring:
+    a unique match switches directly, ``default``/``none``/``reset`` clears
+    the pin, and no match lists the valid ids.
+    """
+    try:
+        models = (
+            await client.rest_get("/api/models?enabled_only=1&kind=llm")
+        ).get("models", []) or []
+    except Exception as e:
+        console.print(f"[red]Failed to list models: {e}[/red]")
+        return
+    models = [m for m in models if m.get("runtime_id")]
+    try:
+        pin = (
+            await client.rest_get(f"/api/sessions/{session_id}/model")
+        ).get("runtime_id")
+    except Exception:
+        pin = None
+
+    if query:
+        q = query.strip().lower()
+        if q in ("default", "none", "reset"):
+            await _model_unpin(client, session_id)
+            return
+        filtered = [
+            m for m in models
+            if q in (m.get("runtime_id") or "").lower()
+            or q in str(m.get("display_name") or "").lower()
+        ]
+        if len(filtered) == 1:
+            await _model_pin(client, session_id, filtered[0])
+            return
+        if not filtered:
+            valid = ", ".join(m["runtime_id"] for m in models) or "(none configured)"
+            console.print(f"[yellow]No model matches {query!r}.[/yellow] [dim]Valid: {valid}[/dim]")
+            return
+        models = filtered  # fall through to the numbered picker over matches
+
+    if not models:
+        console.print("[yellow]No enabled models. Add one via /models.[/yellow]")
+        return
+
+    table = Table(title="Switch model for this session")
+    table.add_column("#", width=3)
+    table.add_column("Model", style="cyan")
+    table.add_column("Provider", style="dim")
+    table.add_column("", width=8)
+    table.add_row("0", "Auto (SmartRouter)", "let the router choose",
+                  "[green]active[/green]" if not pin else "")
+    for i, m in enumerate(models):
+        rid = m["runtime_id"]
+        disp = m.get("display_name") or m.get("model") or rid
+        marker = "[green]active[/green]" if rid == pin else ""
+        table.add_row(str(i + 1), f"{disp}\n[dim]{rid}[/dim]",
+                      str(m.get("provider_name", "")), marker)
+    console.print(table)
+
+    choice = Prompt.ask("Pick # (0 = Auto, q = cancel)", default="q").strip().lower()
+    if choice in ("q", ""):
+        return
+    if choice == "0":
+        await _model_unpin(client, session_id)
+        return
+    if not choice.isdigit():
+        return
+    idx = int(choice) - 1
+    if 0 <= idx < len(models):
+        await _model_pin(client, session_id, models[idx])
+
+
+async def _models_menu(client: GatewayClient, active_session: str | None = None):
     """Model catalog editor — DB-backed + provider-discovery add flow.
 
     Reads the ``models`` table via /api/models. Each row is shown with
     its surrogate id so toggle/remove operations map unambiguously to
-    the DB.
+    the DB. ``active_session`` (the REPL's current session) is offered as
+    the default target for the pin action so the user doesn't have to
+    paste a session id.
     """
     while True:
         db_models = (await client.rest_get("/api/models")).get("models", []) or []
@@ -2390,7 +2537,9 @@ async def _models_menu(client: GatewayClient):
             idx = int(action[1:]) - 1
             if not (0 <= idx < len(db_models)):
                 continue
-            session = Prompt.ask("Session ID (blank for current active session)").strip()
+            session = Prompt.ask(
+                "Session ID", default=active_session or "",
+            ).strip()
             if not session:
                 console.print("[yellow]Session ID required (run /sessions to list).[/yellow]")
                 continue
@@ -2405,7 +2554,9 @@ async def _models_menu(client: GatewayClient):
                 console.print(f"[red]{e}[/red] [dim](cross-framework pins are rejected — unpin first)[/dim]")
 
         elif action == "u":
-            session = Prompt.ask("Session ID to unpin").strip()
+            session = Prompt.ask(
+                "Session ID to unpin", default=active_session or "",
+            ).strip()
             if not session:
                 continue
             try:
