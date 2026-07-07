@@ -284,6 +284,7 @@ def _print_help() -> None:
         ("/status", "Show agent status & queue"),
         ("/clear", "Clear the message queue"),
         ("/usage", "Show monthly spend & budget"),
+        ("/context", "Show context-window usage for this session"),
         ("/vault", "Browse, search, edit notes"),
         ("/mcps", "List & toggle MCP servers"),
         ("/terminal, /shell", "Open an interactive terminal on the agent host (SSH-like)"),
@@ -1308,6 +1309,10 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
 
         if text == "/usage":
             await _usage_menu(client)
+            continue
+
+        if text == "/context":
+            await _context_menu(client, active)
             continue
 
         if text == "/settings":
@@ -2687,6 +2692,92 @@ async def _usage_menu(client: GatewayClient):
                 f"${float(e.get('cost', 0)):.4f}",
             )
         console.print(table)
+
+
+# ── Context window ────────────────────────────────────────────────────────
+
+# Per-section colours for a Claude-Code-style breakdown. Keys mirror the
+# server's section ``key`` values (system, tools, messages, summary, free).
+_CONTEXT_SECTION_COLORS = {
+    "system": "cyan",
+    "tools": "magenta",
+    "messages": "green",
+    "summary": "yellow",
+    "free": "grey37",
+}
+
+
+def _fmt_tokens(n) -> str:
+    """Compact token counts (matches the server): 1000 -> '1.0k', 1_000_000 -> '1.0M'."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+async def _context_menu(client: GatewayClient, session_id: str) -> None:
+    """Show the active conversation's LLM context-window composition."""
+    try:
+        report = await client.rest_get(f"/api/sessions/{session_id}/context")
+    except Exception as e:
+        console.print(f"[dim]Could not load context report: {e}[/dim]")
+        return
+
+    try:
+        sections = report.get("sections", []) or []
+        window = int(report.get("context_window", 0) or 0)
+        if not sections or window <= 0:
+            console.print("[dim]No context to report for this session yet.[/dim]")
+            return
+
+        model_label = report.get("model_label") or report.get("model") or "?"
+        used = int(report.get("used_tokens", 0) or 0)
+        used_pct = float(report.get("used_pct", 0) or 0)
+
+        header = (
+            f"[bold]{model_label}[/bold]\n"
+            f"{_fmt_tokens(used)} / {_fmt_tokens(window)} tokens "
+            f"([bold]{used_pct:.1f}%[/bold] used)"
+        )
+        if report.get("window_source") == "fallback":
+            header += "\n[dim]window size is an estimate[/dim]"
+        console.print(Panel(header, title="Context window", border_style="cyan"))
+
+        width = 20
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Section", no_wrap=True)
+        table.add_column("Tokens", justify="right")
+        table.add_column("%", justify="right")
+        table.add_column("", no_wrap=True)  # bar
+        for s in sections:
+            key = s.get("key", "")
+            label = s.get("label") or key or "?"
+            tokens = int(s.get("tokens", 0) or 0)
+            pct = float(s.get("pct", 0) or 0)
+            color = _CONTEXT_SECTION_COLORS.get(key, "white")
+            filled = max(0, min(width, round(pct / 100 * width)))
+            bar = Text("█" * filled + "░" * (width - filled), style=color)
+            table.add_row(
+                Text(str(label), style=color),
+                _fmt_tokens(tokens),
+                f"{pct:.1f}%",
+                bar,
+            )
+        console.print(table)
+
+        cost = report.get("cost_usd")
+        if cost is not None:
+            console.print(f"[dim]session cost:[/dim] ${float(cost):.4f}")
+        measured = int(report.get("measured_input_tokens", 0) or 0)
+        if measured > 0:
+            console.print(f"[dim]measured last turn:[/dim] {_fmt_tokens(measured)} tokens")
+    except Exception as e:
+        console.print(f"[dim]Could not render context report: {e}[/dim]")
 
 
 # ── File upload ──────────────────────────────────────────────────────────
