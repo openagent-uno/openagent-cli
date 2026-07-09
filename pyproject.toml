@@ -24,4 +24,4 @@ dependencies = [
 ]
 
 [project.scripts]
-openagent-cli = "src.main:main"
+openagent-cli = "openagent_cli.main:main"
