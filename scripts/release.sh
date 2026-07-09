@@ -49,15 +49,16 @@ echo
 # ── Bump version ──
 echo "📦 Bumping $CURRENT → $NEW"
 
-sed -i.bak "s/version = \"$CURRENT\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
-sed -i.bak "s/__version__ = \"$CURRENT\"/__version__ = \"$NEW\"/" "$ROOT/src/__init__.py"
-rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/__init__.py.bak"
+sed -i.bak "s/version = \"[^\"]*\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
+sed -i.bak "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW\"/" "$ROOT/src/__init__.py"
+sed -i.bak "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW\"/" "$ROOT/src/openagent_cli/__init__.py"
+rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/__init__.py.bak" "$ROOT/src/openagent_cli/__init__.py.bak"
 
 # ── Commit + tag + push ──
 echo ""
 echo "📤 Committing and tagging v$NEW..."
 
-git add pyproject.toml src/__init__.py
+git add pyproject.toml src/__init__.py src/openagent_cli/__init__.py
 git commit -m "release: v$NEW"
 git tag "v$NEW" -m "v$NEW"
 
