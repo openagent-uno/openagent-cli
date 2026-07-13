@@ -2049,6 +2049,7 @@ async def _events_menu(client: GatewayClient):
         table.add_column("Type")
         table.add_column("On", width=3)
         table.add_column("Action")
+        table.add_column("Bind")
         table.add_column("Hook path", max_width=32)
         for i, e in enumerate(events):
             table.add_row(
@@ -2057,6 +2058,7 @@ async def _events_menu(client: GatewayClient):
                 e.get("type", "generic"),
                 "✓" if e.get("enabled") else "—",
                 e.get("action_kind", "?"),
+                e.get("session_binding_path") if e.get("session_binding_enabled") else "—",
                 e.get("webhook_path", ""),
             )
         console.print(table)
@@ -2082,6 +2084,10 @@ async def _events_menu(client: GatewayClient):
                 body["action_ref"] = Prompt.ask(
                     "Target workflow id/name" if akind == "workflow" else "Target scheduled-task id"
                 ).strip()
+            if Confirm.ask("Bind event run sessions by a payload field?", default=False):
+                path = Prompt.ask("Payload path to bind", default="id").strip()
+                body["session_binding_enabled"] = True
+                body["session_binding_path"] = path or "id"
             res = await client.rest_post("/api/events", body)
             if res.get("error"):
                 console.print(f"[red]{res['error']}[/red]")
@@ -2104,6 +2110,16 @@ async def _events_menu(client: GatewayClient):
                     body["prompt_template"] = Prompt.ask("Prompt", default=e.get("prompt_template", "") or "")
                 else:
                     body["action_ref"] = Prompt.ask("Target", default=e.get("action_ref", "") or "")
+                bind_default = bool(e.get("session_binding_enabled"))
+                bind = Confirm.ask("Bind event run sessions by a payload field?", default=bind_default)
+                body["session_binding_enabled"] = bind
+                if bind:
+                    body["session_binding_path"] = Prompt.ask(
+                        "Payload path to bind",
+                        default=e.get("session_binding_path") or "id",
+                    ).strip() or "id"
+                else:
+                    body["session_binding_path"] = e.get("session_binding_path") or None
                 res = await client.rest_patch(f"/api/events/{e['id']}", body)
                 if res.get("error"):
                     console.print(f"[red]{res['error']}[/red]")
