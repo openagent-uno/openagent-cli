@@ -295,6 +295,7 @@ def _print_help() -> None:
         ("/settings", "Edit identity, prompt, channels, dream, auto-update"),
         ("/tasks", "Manage scheduled tasks + view run history"),
         ("/workflows", "List workflows, run, view run history, set concurrency"),
+        ("/events", "Manage webhook events + delivery history"),
         ("/config", "Show config summary"),
         ("/restart", "Restart the agent"),
         ("/update", "Check for and install updates"),
@@ -1278,6 +1279,10 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
             await _workflows_menu(client)
             continue
 
+        if text in ("/events", "/event"):
+            await _events_menu(client)
+            continue
+
         if text == "/mcps":
             await _mcps_menu(client)
             continue
@@ -1726,8 +1731,8 @@ async def _channels_submenu(client: GatewayClient, cfg: dict):
     # The "g" (gateway/websocket) branch is gone — gateway transport
     # is now Iroh + handle@network credentials managed outside this
     # menu (`openagent network` subcommands and `openagent-cli connect`).
-    console.print("\n[bold]Channels[/bold]: t(elegram), d(iscord), w(hatsApp)")
-    which = Prompt.ask("Edit", choices=["t", "d", "w", "q"], default="q")
+    console.print("\n[bold]Channels[/bold]: t(elegram), d(iscord), w(hatsApp), web(hook)")
+    which = Prompt.ask("Edit", choices=["t", "d", "w", "web", "q"], default="q")
     if which == "q":
         return
 
@@ -1780,6 +1785,26 @@ async def _channels_submenu(client: GatewayClient, cfg: dict):
         else:
             new_channels.pop("whatsapp", None)
         await client.rest_patch("/api/config/channels", new_channels)
+
+    elif which == "web":
+        wh = channels.get("webhook", {}) or {}
+        enabled = Confirm.ask("Enable the webhook listener?", default=bool(wh.get("enabled")))
+        host = Prompt.ask("Bind host", default=wh.get("host", "0.0.0.0"))
+        port = Prompt.ask("Port", default=str(wh.get("port", 8899)))
+        public_url = Prompt.ask("Public URL (blank if none)", default=wh.get("public_url", ""))
+        new_channels = dict(channels)
+        try:
+            port_int = int(port)
+        except ValueError:
+            port_int = 8899
+        new_channels["webhook"] = {
+            "enabled": enabled,
+            "host": host.strip() or "0.0.0.0",
+            "port": port_int,
+            **({"public_url": public_url.strip()} if public_url.strip() else {}),
+        }
+        await client.rest_patch("/api/config/channels", new_channels)
+        console.print("[dim]Configure individual events with /events.[/dim]")
 
     console.print("[green]Saved. Restart required for channel changes.[/green]")
 
@@ -2000,6 +2025,148 @@ async def _tasks_menu(client: GatewayClient):
                 )
                 if res.get("error"):
                     console.print(f"[red]{res['error']}[/red]")
+
+
+# ── Events (webhook channel) ─────────────────────────────────────────────
+
+
+async def _events_menu(client: GatewayClient):
+    """Webhook events — DB-backed via ``/api/events``.
+
+    An event binds an inbound webhook to an action (a workflow, a scheduled
+    task, or a chat prompt). Deliveries surface in the run history like any
+    other execution. The webhook listener itself is configured under
+    ``/settings`` → channels → webhook.
+    """
+    action_kinds = {"p": "prompt", "w": "workflow", "s": "scheduled_task"}
+    while True:
+        data = await client.rest_get("/api/events")
+        events = data.get("events", []) or []
+
+        table = Table(title=f"Events ({len(events)})")
+        table.add_column("#", width=3)
+        table.add_column("Name", style="cyan")
+        table.add_column("Type")
+        table.add_column("On", width=3)
+        table.add_column("Action")
+        table.add_column("Hook path", max_width=32)
+        for i, e in enumerate(events):
+            table.add_row(
+                str(i + 1),
+                e.get("name", "?"),
+                e.get("type", "generic"),
+                "✓" if e.get("enabled") else "—",
+                e.get("action_kind", "?"),
+                e.get("webhook_path", ""),
+            )
+        console.print(table)
+        console.print("[cyan]a[/cyan]dd, [cyan]e[/cyan]dit #, [cyan]f[/cyan]ire #, [cyan]r[/cyan]otate-secret #, [cyan]h[/cyan]istory #, [cyan]t[/cyan]oggle #, [cyan]d[/cyan]elete #, [cyan]q[/cyan]uit")
+        action = Prompt.ask("Action", default="q")
+        action = action.strip().lower()
+
+        if action in ("q", ""):
+            return
+
+        if action == "a":
+            name = Prompt.ask("Name (e.g. github-push)").strip()
+            if not name:
+                console.print("[red]Name required[/red]")
+                continue
+            etype = Prompt.ask("Type", choices=["generic", "generic-hmac", "github", "stripe", "slack"], default="generic")
+            akind_key = Prompt.ask("Action: p(rompt), w(orkflow), s(cheduled task)", choices=["p", "w", "s"], default="p")
+            akind = action_kinds[akind_key]
+            body = {"name": name, "type": etype, "action_kind": akind}
+            if akind == "prompt":
+                body["prompt_template"] = Prompt.ask("Prompt (use {{payload.x}} for payload data)").strip()
+            else:
+                body["action_ref"] = Prompt.ask(
+                    "Target workflow id/name" if akind == "workflow" else "Target scheduled-task id"
+                ).strip()
+            res = await client.rest_post("/api/events", body)
+            if res.get("error"):
+                console.print(f"[red]{res['error']}[/red]")
+            else:
+                secret = res.get("secret")
+                console.print("[green]Created.[/green]")
+                if secret:
+                    console.print(f"[yellow]Secret (shown once):[/yellow] [bold]{secret}[/bold]")
+                    url = res.get("webhook_url") or f"<public-url>{res.get('webhook_path','')}"
+                    console.print(f"[dim]POST {url}  -H 'X-OpenAgent-Event-Secret: {secret}'[/dim]")
+
+        elif action.startswith("e") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                name = Prompt.ask("Name", default=e.get("name", ""))
+                etype = Prompt.ask("Type", choices=["generic", "generic-hmac", "github", "stripe", "slack"], default=e.get("type", "generic"))
+                body = {"name": name, "type": etype}
+                if e.get("action_kind") == "prompt":
+                    body["prompt_template"] = Prompt.ask("Prompt", default=e.get("prompt_template", "") or "")
+                else:
+                    body["action_ref"] = Prompt.ask("Target", default=e.get("action_ref", "") or "")
+                res = await client.rest_patch(f"/api/events/{e['id']}", body)
+                if res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    console.print("[green]Saved.[/green]")
+
+        elif action.startswith("f") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                console.print(f"[dim]Firing '{e.get('name')}' with a test payload…[/dim]")
+                res = await client.rest_post(
+                    f"/api/events/{e['id']}/trigger",
+                    {"payload": {"test": True}, "wait": True, "timeout_s": 120},
+                )
+                if isinstance(res, dict) and res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+                else:
+                    status = res.get("status") if isinstance(res, dict) else None
+                    console.print(f"[green]Delivery {status or 'dispatched'}.[/green]")
+
+        elif action.startswith("r") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                if Confirm.ask(f"Rotate the secret for '{e.get('name')}'? The old one stops working.", default=False):
+                    res = await client.rest_post(f"/api/events/{e['id']}/rotate-secret", {})
+                    if res.get("error"):
+                        console.print(f"[red]{res['error']}[/red]")
+                    elif res.get("secret"):
+                        console.print(f"[yellow]New secret (shown once):[/yellow] [bold]{res['secret']}[/bold]")
+
+        elif action.startswith("h") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                deliveries = (await client.rest_get(f"/api/events/{e['id']}/deliveries")).get("deliveries", [])
+                dtable = Table(title=f"Deliveries — {e.get('name')} ({len(deliveries)})")
+                dtable.add_column("Status")
+                dtable.add_column("Source")
+                dtable.add_column("Detail", max_width=60)
+                for d in deliveries:
+                    dtable.add_row(_run_status_markup(d.get("status", "?")), d.get("source", "?"), _run_detail(d))
+                console.print(dtable)
+
+        elif action.startswith("t") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                res = await client.rest_patch(f"/api/events/{e['id']}", {"enabled": not e.get("enabled")})
+                if res.get("error"):
+                    console.print(f"[red]{res['error']}[/red]")
+
+        elif action.startswith("d") and action[1:].isdigit():
+            idx = int(action[1:]) - 1
+            if 0 <= idx < len(events):
+                e = events[idx]
+                if Confirm.ask(f"Delete '{e.get('name')}'?", default=False):
+                    res = await client.rest_delete(f"/api/events/{e['id']}")
+                    if res.get("error"):
+                        console.print(f"[red]{res['error']}[/red]")
+                    else:
+                        console.print("[green]Deleted.[/green]")
 
 
 # ── Workflows ────────────────────────────────────────────────────────────
