@@ -1,2 +1,2 @@
 """OpenAgent CLI — connects to any OpenAgent Gateway via WebSocket."""
-__version__ = "0.14.5"
+__version__ = "0.15.0"
