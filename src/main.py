@@ -2443,7 +2443,7 @@ async def _model_pin(client: GatewayClient, session_id: str, m: dict) -> None:
 async def _model_unpin(client: GatewayClient, session_id: str) -> None:
     try:
         await client.rest_delete(f"/api/sessions/{session_id}/model")
-        console.print("[green]Model pin cleared — SmartRouter will pick the best model.[/green]")
+        console.print("[green]Model pin cleared — back to Auto (the router chooses).[/green]")
     except Exception as e:
         console.print(f"[red]{e}[/red]")
 
@@ -2454,7 +2454,7 @@ async def _model_quick_pick(
     """Focused ``/model`` picker for the active session.
 
     Lists enabled LLM models in a numbered table (with the current pin
-    marked and an ``Auto`` / SmartRouter option), then pins the chosen
+    marked and an ``Auto`` / router option), then pins the chosen
     model to ``session_id`` via ``PUT /api/sessions/{id}/model``. When
     ``query`` is given (``/model <partial>``) it pre-filters by substring:
     a unique match switches directly, ``default``/``none``/``reset`` clears
@@ -2503,7 +2503,7 @@ async def _model_quick_pick(
     table.add_column("Model", style="cyan")
     table.add_column("Provider", style="dim")
     table.add_column("", width=8)
-    table.add_row("0", "Auto (SmartRouter)", "let the router choose",
+    table.add_row("0", "Auto (router)", "let the router choose",
                   "[green]active[/green]" if not pin else "")
     for i, m in enumerate(models):
         rid = m["runtime_id"]
