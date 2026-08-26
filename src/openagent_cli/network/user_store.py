@@ -63,7 +63,7 @@ class UserStore:
 
 
 def _user_dir() -> Path:
-    p = Path.home() / ".openagent" / "user"
+    p = user_identity_path().parent
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -264,4 +264,3 @@ def ensure_user_identity_dir() -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     (p.parent / "certs").mkdir(exist_ok=True)
     return p.parent
-

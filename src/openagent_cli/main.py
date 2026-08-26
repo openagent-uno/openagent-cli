@@ -823,7 +823,12 @@ async def _run_agents_cli(network_name: str | None):
     node = IrohNode(device_identity)
     await node.start()
     try:
-        agents = await coord_list_agents(node=node, coordinator_node_id=net.coordinator_node_id)
+        agents = await coord_list_agents(
+            node=node,
+            coordinator_node_id=net.coordinator_node_id,
+            relay_url=net.coordinator_relay_url,
+            addresses=list(net.coordinator_addresses),
+        )
     finally:
         await node.stop()
     if not agents:

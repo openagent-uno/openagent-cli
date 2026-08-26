@@ -35,6 +35,12 @@ class NetworkBinding:
     coordinator_node_id: str
     coordinator_pubkey_bytes: bytes
     our_handle: str
+    # First-contact hints are valid for the coordinator NodeId only.  They let
+    # a freshly joined client reconnect to a coordinator-hosted gateway even
+    # when discovery is disabled or unavailable (the invite already supplied
+    # the exact direct/relay address).
+    coordinator_relay_url: str | None = None
+    coordinator_addresses: tuple[str, ...] = ()
 
 
 class SessionDialer:
@@ -116,7 +122,19 @@ class SessionDialer:
                 # the next ``open_bi`` fail-and-retry path handle it.
                 pass
             if conn is None:
-                conn = await self._node.dial(node_id, NetworkAlpn.GATEWAY)
+                is_coordinator = node_id == self._binding.coordinator_node_id
+                conn = await self._node.dial(
+                    node_id,
+                    NetworkAlpn.GATEWAY,
+                    relay_url=(
+                        self._binding.coordinator_relay_url if is_coordinator else None
+                    ),
+                    addresses=(
+                        list(self._binding.coordinator_addresses)
+                        if is_coordinator
+                        else None
+                    ),
+                )
                 self._connections[node_id] = conn
             return conn
 
@@ -322,4 +340,3 @@ class LoopbackProxy:
                     pass
 
         await asyncio.gather(local_to_iroh(), iroh_to_local(), return_exceptions=True)
-

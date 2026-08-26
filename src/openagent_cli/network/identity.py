@@ -152,5 +152,13 @@ def user_identity_path() -> Path:
     one user can drive many agents, and the same user identity travels
     with the device, not the agent.
     """
-    return Path.home() / ".openagent" / "user" / "identity.key"
-
+    # Test harnesses and multi-profile launchers can isolate all client-side
+    # credentials without repurposing HOME.  The default remains byte-for-byte
+    # compatible with existing installs.
+    override = os.environ.get("OPENAGENT_USER_DIR")
+    user_dir = (
+        Path(override).expanduser()
+        if override
+        else Path.home() / ".openagent" / "user"
+    )
+    return user_dir / "identity.key"

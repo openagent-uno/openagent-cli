@@ -235,6 +235,8 @@ class GatewayClient:
         device_identity = load_or_create_identity(user_store.user_identity_path())
 
         node = IrohNode(device_identity)
+        coordinator_relay_url = getattr(net, "coordinator_relay_url", None)
+        coordinator_addresses = list(getattr(net, "coordinator_addresses", None) or [])
 
         # Cert: load from disk; refresh if missing/expired.
         cert_wire = user_store.read_cert(net)
@@ -266,6 +268,8 @@ class GatewayClient:
                     password=password,
                     device_identity=device_identity,
                     network_id=net.network_id,
+                    relay_url=coordinator_relay_url,
+                    addresses=coordinator_addresses,
                 )
                 user_store.write_cert(net, cert_wire)
                 from .network.user_store import save
@@ -287,6 +291,8 @@ class GatewayClient:
             coordinator_node_id=net.coordinator_node_id,
             coordinator_pubkey_bytes=net.coordinator_pubkey_bytes,
             our_handle=handle,
+            coordinator_relay_url=coordinator_relay_url,
+            coordinator_addresses=tuple(coordinator_addresses),
         )
         dialer = SessionDialer(node=node, binding=binding, cert_wire=cert_wire)
 
@@ -296,7 +302,10 @@ class GatewayClient:
         proxy = None
         try:
             agents = await coord_list_agents(
-                node=node, coordinator_node_id=net.coordinator_node_id
+                node=node,
+                coordinator_node_id=net.coordinator_node_id,
+                relay_url=coordinator_relay_url,
+                addresses=coordinator_addresses,
             )
             if not agents:
                 raise LookupError(f"no agents registered in network {network_name!r}")

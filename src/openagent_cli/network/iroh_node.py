@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Awaitable, Callable
 
 import iroh
@@ -155,10 +156,16 @@ class IrohNode:
             alpn: _PythonProtocolCreator(alpn.decode(errors="replace"), handler)
             for alpn, handler in self._handlers.items()
         }
+        discovery_setting = os.environ.get("OPENAGENT_IROH_DISCOVERY", "").strip().lower()
+        local_only = discovery_setting in {"none", "off", "disabled"}
         opts = iroh.NodeOptions(
             secret_key=self.identity.secret_bytes,
             protocols=creators or None,
-            node_discovery=iroh.NodeDiscoveryConfig.DEFAULT,
+            node_discovery=(
+                iroh.NodeDiscoveryConfig.NONE
+                if local_only
+                else iroh.NodeDiscoveryConfig.DEFAULT
+            ),
             enable_docs=False,
         )
         self._node = await iroh.Iroh.memory_with_options(opts)
@@ -321,4 +328,3 @@ def _node_id_from_secret(secret_bytes: bytes) -> str:
     # form. ``fmt_short()`` is the 10-char abbreviated form intended
     # for logs and IS NOT round-trippable through ``from_string``.
     return str(iroh.PublicKey.from_bytes(pub_raw))
-
