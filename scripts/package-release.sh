@@ -47,6 +47,8 @@ esac
 # Resolve the version from the installed Python package. Runs in the
 # repo root (the CI job's default cwd) so PyInstaller's dist/ tree
 # can't shadow the import.
+# Keep exact external SemVer spelling (for example ``0.16.0-beta.1``) in
+# release filenames. Python distribution metadata is allowed to normalize it.
 VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
 
 # Unified SHA-256 helper — macOS has ``shasum``, Linux/Git Bash have

@@ -116,14 +116,15 @@ if [ "$WANT_PKG" = true ]; then
     # ``openagent.app`` submodule and the build fails.
     PKG_BASE="${BINARY_NAME%.app}"
     MODULE="src"
-    PKG_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+    RELEASE_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+    PKG_VERSION="$(python -c "from importlib.metadata import version; print(version('openagent-cli'))")"
     PKG_ARCH_RAW="$(uname -m)"
     case "$PKG_ARCH_RAW" in
         x86_64|amd64)  PKG_ARCH="x64" ;;
         aarch64|arm64) PKG_ARCH="arm64" ;;
         *) PKG_ARCH="$PKG_ARCH_RAW" ;;
     esac
-    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
+    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${RELEASE_VERSION}-macos-${PKG_ARCH}.pkg"
 fi
 
 # ── Skip cleanly when the binary-signing secrets are missing ──────────
