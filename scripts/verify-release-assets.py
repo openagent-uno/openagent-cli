@@ -58,7 +58,12 @@ for sidecar_name in sorted(name for name in expected if name.endswith(".sha256")
     sidecar = next(path for path in files if path.name == sidecar_name)
     target = sidecar_name.removesuffix(".sha256")
     parts = sidecar.read_text(encoding="utf-8").strip().split()
-    if len(parts) != 2 or parts[0] != local[target]["digest"] or Path(parts[1]).name != target:
+    # GNU checksum files use ``*filename`` for binary mode. Git Bash emits
+    # that valid form on Windows, while Linux/macOS normally use a plain
+    # filename. Remove only the optional marker and keep the exact basename
+    # requirement so a nested or substituted path cannot pass validation.
+    listed_target = parts[1].removeprefix("*") if len(parts) == 2 else ""
+    if len(parts) != 2 or parts[0] != local[target]["digest"] or listed_target != target:
         raise SystemExit(f"invalid checksum sidecar: {sidecar_name}")
 
 if args.release_json:
