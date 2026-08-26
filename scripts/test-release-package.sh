@@ -79,8 +79,44 @@ case "$release_os" in
         release_binary="$release_tmp/$release_app"
         ;;
     windows)
-        tar -xf "$release_archive" -C "$release_tmp"
+        python - "$release_archive" "$release_tmp" "${release_app}.exe" <<'PY'
+import shutil
+import sys
+import zipfile
+from pathlib import Path, PurePosixPath
+
+
+archive_path, destination, expected_name = sys.argv[1:]
+with zipfile.ZipFile(archive_path) as archive:
+    corrupt_entry = archive.testzip()
+    if corrupt_entry is not None:
+        raise SystemExit(f"corrupt ZIP entry: {corrupt_entry!r}")
+
+    files: list[str] = []
+    expected_entry = None
+    for entry in archive.infolist():
+        normalized = entry.filename.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"unsafe ZIP entry: {entry.filename!r}")
+        if entry.is_dir():
+            continue
+        files.append(normalized)
+        if normalized == expected_name:
+            expected_entry = entry
+
+    expected = {expected_name}
+    if set(files) != expected or len(files) != len(expected):
+        raise SystemExit(f"unexpected ZIP entries: {sorted(files)!r}")
+    if expected_entry is None:
+        raise SystemExit(f"missing ZIP entry: {expected_name!r}")
+
+    target = Path(destination) / expected_name
+    with archive.open(expected_entry) as source, target.open("wb") as output:
+        shutil.copyfileobj(source, output)
+PY
         release_binary="$release_tmp/${release_app}.exe"
+        chmod +x "$release_binary"
         ;;
 esac
 
