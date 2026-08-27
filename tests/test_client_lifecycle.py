@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 import aiohttp
 
-from openagent_cli.client import GatewayClient, _StreamCollector
+from openagent_cli.client import (
+    CLI_CLIENT_CAPABILITIES,
+    GatewayClient,
+    _StreamCollector,
+    _session_open_frame,
+    _text_final_frame,
+)
 
 
 class _WebSocket:
@@ -74,6 +80,32 @@ class _Dialer:
 
 
 class GatewayLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cli_session_open_advertises_attachment_only_surface(self):
+        frame = _session_open_frame(
+            "session-1",
+            profile="batched",
+            language=None,
+            client_kind="cli",
+        )
+        self.assertEqual(frame["client_capabilities"], CLI_CLIENT_CAPABILITIES)
+        self.assertTrue(frame["client_capabilities"]["attachments"])
+        self.assertFalse(frame["client_capabilities"]["inline_ui"])
+
+    async def test_text_final_carries_durable_structured_attachments(self):
+        attachment = {
+            "artifact_id": "artifact-1",
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 42,
+            "sha256": "a" * 64,
+            "type": "file",
+        }
+        frame = _text_final_frame(
+            "session-1", "Inspect the attached report.", "user_typed", [attachment]
+        )
+        self.assertEqual(frame["attachments"], [attachment])
+        self.assertNotIn("path", frame["attachments"][0])
+
     async def test_from_network_cancellation_closes_node_and_dialer(self):
         node = _Node()
         dialer = _Dialer()

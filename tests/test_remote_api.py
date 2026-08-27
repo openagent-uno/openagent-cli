@@ -269,11 +269,13 @@ class RequestValidationTests(unittest.TestCase):
                 },
                 "global_search": {
                     "version": 1,
-                    "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+                    "scopes": [
+                        "chats", "tools", "workflows", "scheduled", "events", "views",
+                    ],
                     "targets": [
                         "chat", "chat_message", "chat_tool", "workflow_definition",
                         "workflow_run", "scheduled_definition", "scheduled_run",
-                        "event_definition", "event_delivery",
+                        "event_definition", "event_delivery", "ui_view",
                     ],
                     "snapshot_pagination": True,
                 },
@@ -289,6 +291,11 @@ class RequestValidationTests(unittest.TestCase):
         capabilities = self._capabilities()
         capabilities["features"]["global_search"]["targets"].pop()
         with self.assertRaisesRegex(RemoteProtocolError, "incompatible.*targets"):
+            RemoteAPIClient.require_global_search_v1(capabilities)
+
+        capabilities = self._capabilities()
+        capabilities["features"]["global_search"]["scopes"].remove("views")
+        with self.assertRaisesRegex(RemoteProtocolError, "incompatible.*scopes"):
             RemoteAPIClient.require_global_search_v1(capabilities)
 
     def test_history_ready_false_takes_precedence_over_search_state(self):
@@ -307,8 +314,18 @@ class RequestValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scope"):
             SearchQuery(query="x", scopes=("vault",))
 
+        query = SearchQuery(query="x", scopes=("views",))
+        self.assertEqual(query.scopes, ("views",))
+
     def test_parent_and_root_filters_are_paired(self):
         with self.assertRaisesRegex(ValueError, "parent_type"):
             HistoryQuery(parent_type="session")
         with self.assertRaisesRegex(ValueError, "root_kind"):
             SearchQuery(query="x", scopes=("chats",), root_kind="chat")
+
+        query = SearchQuery(
+            query="dashboard", scopes=("views",), root_kind="ui_view", root_id="view-1",
+        )
+        self.assertEqual(query.to_body()["filters"]["root"], {
+            "kind": "ui_view", "id": "view-1",
+        })

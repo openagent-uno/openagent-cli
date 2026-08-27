@@ -24,11 +24,13 @@ CAPABILITIES = {
         },
         "global_search": {
             "version": 1,
-            "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+            "scopes": [
+                "chats", "tools", "workflows", "scheduled", "events", "views",
+            ],
             "targets": [
                 "chat", "chat_message", "chat_tool", "workflow_definition",
                 "workflow_run", "scheduled_definition", "scheduled_run",
-                "event_definition", "event_delivery",
+                "event_definition", "event_delivery", "ui_view",
             ],
             "snapshot_pagination": True,
         },
@@ -151,6 +153,67 @@ class CLIHistorySearchTests(unittest.TestCase):
         query, _all_pages = api.search_call
         self.assertEqual(query.query, "database locked")
         self.assertEqual(query.scopes, ("tools", "workflows"))
+
+    def test_search_defaults_include_views_and_preserve_view_target(self):
+        target = {"kind": "ui_view", "view_id": "view/one?two"}
+        page = {
+            "items": [{"result_id": "ui_view:view/one?two", "target": target}],
+            "has_more": False,
+            "next_cursor": None,
+        }
+        api = _API(search=page)
+        with patch.object(main, "_open_gateway_for_rest", new=_opener(_Client(api))):
+            result = self.runner.invoke(main.cli, ["search", "CPU dashboard", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output)["items"][0]["target"], target)
+        query, _all_pages = api.search_call
+        self.assertEqual(query.scopes, (
+            "chats", "tools", "workflows", "scheduled", "events", "views",
+        ))
+
+    def test_view_target_has_copyable_stable_client_route_in_human_output(self):
+        page = {
+            "items": [{
+                "result_id": "ui_view:view/one?two",
+                "root": {
+                    "kind": "ui_view", "title": "CPU", "occurred_at": None,
+                },
+                "matches": [],
+                "target": {"kind": "ui_view", "view_id": "view/one?two"},
+            }],
+            "has_more": False,
+            "next_cursor": None,
+        }
+        with patch.object(
+            main, "_open_gateway_for_rest", new=_opener(_Client(_API(search=page))),
+        ):
+            result = self.runner.invoke(main.cli, ["search", "CPU"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("/views/view%2Fone%3Ftwo", result.output)
+
+    def test_interactive_help_mentions_views_search(self):
+        with main.console.capture() as capture:
+            main._print_help()
+        help_text = capture.get()
+        self.assertIn("/search <query>", help_text)
+        self.assertIn("Views", help_text)
+
+    def test_search_accepts_view_root_filter(self):
+        page = {"items": [], "has_more": False, "next_cursor": None}
+        api = _API(search=page)
+        with patch.object(main, "_open_gateway_for_rest", new=_opener(_Client(api))):
+            result = self.runner.invoke(main.cli, [
+                "search", "CPU", "--scope", "views",
+                "--root-kind", "ui_view", "--root-id", "view-1", "--json",
+            ])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        query, _all_pages = api.search_call
+        self.assertEqual(query.scopes, ("views",))
+        self.assertEqual(query.root_kind, "ui_view")
+        self.assertEqual(query.root_id, "view-1")
 
     def test_no_match_has_documented_exit_one_and_valid_json(self):
         page = {"items": [], "has_more": False, "next_cursor": None}
