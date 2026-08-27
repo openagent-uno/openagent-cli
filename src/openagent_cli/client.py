@@ -52,6 +52,17 @@ _TERMINAL_FRAMES = frozenset({
     TERMINAL_READY, TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR,
 })
 
+# The CLI deliberately remains a text/attachment surface.  Advertising this
+# explicitly lets a newer gateway keep Custom View markers out of terminal
+# replies while still delivering durable files and images.
+CLI_CLIENT_CAPABILITIES = {
+    "attachments": True,
+    "ordered_parts": False,
+    "inline_ui": False,
+    "sidebar_ui": False,
+    "custom_ui_version": 0,
+}
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -110,7 +121,8 @@ def _fold_wire_frame(collector: _StreamCollector, data: dict) -> bool:
 
 
 def _session_open_frame(session_id: str, *, profile: str, language: str | None,
-                        client_kind: str | None, speak: bool = False) -> dict:
+                        client_kind: str | None, speak: bool = False,
+                        client_capabilities: dict | None = None) -> dict:
     frame = {
         "type": "session_open",
         "session_id": session_id,
@@ -122,17 +134,28 @@ def _session_open_frame(session_id: str, *, profile: str, language: str | None,
         frame["language"] = language
     if client_kind is not None:
         frame["client_kind"] = client_kind
+    frame["client_capabilities"] = dict(
+        CLI_CLIENT_CAPABILITIES if client_capabilities is None else client_capabilities
+    )
     return frame
 
 
-def _text_final_frame(session_id: str, text: str, source: str) -> dict:
-    return {
+def _text_final_frame(
+    session_id: str,
+    text: str,
+    source: str,
+    attachments: list[dict] | None = None,
+) -> dict:
+    frame = {
         "type": "text_final",
         "session_id": session_id,
         "ts_ms": _now_ms(),
         "text": text,
         "source": source,
     }
+    if attachments:
+        frame["attachments"] = [dict(item) for item in attachments]
+    return frame
 
 
 class GatewayClient:
@@ -559,6 +582,7 @@ class GatewayClient:
         source: str = "user_typed",
         on_reasoning: Callable | None = None,
         on_compaction: Callable | None = None,
+        attachments: list[dict] | None = None,
     ) -> dict:
         """Push a typed message into the user's stream session and await the reply.
 
@@ -588,7 +612,9 @@ class GatewayClient:
             self._compaction_cb[session_id] = on_compaction
 
         try:
-            await self._ws.send_json(_text_final_frame(session_id, text, source))
+            await self._ws.send_json(
+                _text_final_frame(session_id, text, source, attachments)
+            )
         except Exception:
             self._stream_pending.pop(session_id, None)
             self._status_cb.pop(session_id, None)
@@ -634,12 +660,14 @@ class GatewayClient:
         profile: str = "realtime",
         language: str | None = None,
         client_kind: str | None = "cli",
+        client_capabilities: dict | None = None,
     ) -> None:
         await self._ws.send_json(_session_open_frame(
             session_id,
             profile=profile,
             language=language,
             client_kind=client_kind,
+            client_capabilities=client_capabilities,
         ))
 
     async def send_session_close(self, session_id: str) -> None:
@@ -650,9 +678,16 @@ class GatewayClient:
         })
 
     async def send_text_final(
-        self, session_id: str, text: str, *, source: str = "user_typed"
+        self,
+        session_id: str,
+        text: str,
+        *,
+        source: str = "user_typed",
+        attachments: list[dict] | None = None,
     ) -> None:
-        await self._ws.send_json(_text_final_frame(session_id, text, source))
+        await self._ws.send_json(
+            _text_final_frame(session_id, text, source, attachments)
+        )
 
     async def send_audio_chunk_in(
         self,
@@ -772,6 +807,25 @@ class GatewayClient:
         token query parameter is appended anymore.
         """
         async with self._session.get(f"{self.base_url}/api/files", params={"path": remote_path}) as r:
+            if r.status != 200:
+                body = await r.text()
+                raise RuntimeError(f"{r.status} {body[:200]}")
+            total = 0
+            with open(dest_path, "wb") as f:
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    total += len(chunk)
+            return total
+
+    async def download_artifact(self, artifact_id: str, dest_path: str) -> int:
+        """Fetch a durable attachment through its ACL-checked CAS endpoint."""
+
+        safe_id = str(artifact_id or "").strip()
+        if not safe_id:
+            raise ValueError("artifact_id is required")
+        async with self._session.get(
+            f"{self.base_url}/api/artifacts/{safe_id}/content"
+        ) as r:
             if r.status != 200:
                 body = await r.text()
                 raise RuntimeError(f"{r.status} {body[:200]}")

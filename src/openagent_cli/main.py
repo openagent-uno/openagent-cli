@@ -18,6 +18,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 import click
@@ -119,11 +120,12 @@ async def _render_response(response: dict, client: "GatewayClient | None" = None
         console.print("[dim]Attachments:[/dim]")
         for att in attachments:
             remote_path = att.get("path", "")
+            artifact_id = att.get("artifact_id") or att.get("artifactId")
             filename = att.get("filename") or os.path.basename(remote_path) or "attachment"
             kind = att.get("type", "file")
             icon = {"image": "🖼", "voice": "🎤", "video": "🎬", "file": "📄"}.get(kind, "📎")
 
-            if remote_path and os.path.isfile(remote_path):
+            if not artifact_id and remote_path and os.path.isfile(remote_path):
                 console.print(f"  {icon} [cyan]{filename}[/cyan] [dim]→ {remote_path}[/dim]")
                 continue
 
@@ -145,7 +147,14 @@ async def _render_response(response: dict, client: "GatewayClient | None" = None
                         dest = candidate
                         break
             try:
-                bytes_written = await client.download_file(remote_path, str(dest))
+                if artifact_id:
+                    bytes_written = await client.download_artifact(
+                        str(artifact_id), str(dest),
+                    )
+                elif remote_path:
+                    bytes_written = await client.download_file(remote_path, str(dest))
+                else:
+                    raise RuntimeError("attachment has no durable content reference")
                 console.print(f"  {icon} [green]{filename}[/green] [dim]→ {dest} ({bytes_written:,} bytes)[/dim]")
             except Exception as e:  # noqa: BLE001 — inform user of any fetch failure, keep loop alive
                 console.print(f"  {icon} [red]{filename}[/red] [dim](download failed: {e})[/dim]")
@@ -153,7 +162,11 @@ async def _render_response(response: dict, client: "GatewayClient | None" = None
 
 
 async def _send_message_with_indicator(
-    client: "GatewayClient", text: str, session_id: str
+    client: "GatewayClient",
+    text: str,
+    session_id: str,
+    *,
+    attachments: list[dict] | None = None,
 ) -> None:
     """Send a chat turn while showing an animated "Reasoning…" spinner,
     then render the response.
@@ -205,6 +218,7 @@ async def _send_message_with_indicator(
             client.send_message(
                 text, session_id, on_status=on_status, on_reasoning=on_reasoning,
                 on_compaction=on_compaction,
+                attachments=attachments,
             )
         )
 
@@ -332,6 +346,12 @@ def _target_label(target: Any) -> str:
     """Render the canonical wire target without inventing target aliases."""
     if not isinstance(target, dict):
         return "—"
+    # Views have a stable client route. Keep the opaque id byte-for-byte in
+    # machine output, while making the human table useful as a copyable route.
+    if target.get("kind") == "ui_view" and isinstance(target.get("view_id"), str):
+        view_id = target["view_id"]
+        if view_id:
+            return f"/views/{quote(view_id, safe='')}"
     return json.dumps(target, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -460,7 +480,7 @@ def _print_help() -> None:
         ("/help", "Show this help"),
         ("/new", "Start a fresh conversation"),
         ("/history", "Show unified operational history"),
-        ("/search <query>", "Search chats, tools, workflows, tasks, and events"),
+        ("/search <query>", "Search chats, tools, workflows, tasks, events, and Views"),
         ("/sessions, /switch <id>", "List or switch sessions"),
         ("/rename <id> <name>", "Rename a session"),
         ("/delete <id>", "Delete a session (with confirmation)"),
@@ -1111,7 +1131,7 @@ async def _run_history_cli(
 @cli.command("search")
 @click.argument("query_text", required=False, default="")
 @click.option("--scope", "scopes", multiple=True, metavar="SCOPE[,SCOPE]",
-              default=("chats", "tools", "workflows", "scheduled", "events"),
+              default=("chats", "tools", "workflows", "scheduled", "events", "views"),
               help=f"Explicit operational scope(s): {', '.join(sorted(SEARCH_SCOPES))}.")
 @click.option("--status", "statuses", multiple=True, metavar="STATUS[,STATUS]",
               help=f"Run status(es): {', '.join(sorted(RUN_STATUSES))}.")
@@ -1156,7 +1176,7 @@ def search_cmd(
     agent_handle: str | None, principal_handle: str | None,
     password: str | None, as_json: bool,
 ):
-    """Search authorized chats, tools, workflows, tasks and events.
+    """Search authorized chats, tools, workflows, tasks, events and Views.
 
     Query text is sent only in the POST body, never the URL. Exit codes are the
     same as ``history``.
@@ -1677,7 +1697,9 @@ async def _interactive_loop(client: GatewayClient, *, network_name: str, handle:
                 api.require_global_search_v1(capabilities)
                 query = SearchQuery(
                     query=query_text,
-                    scopes=("chats", "tools", "workflows", "scheduled", "events"),
+                    scopes=(
+                        "chats", "tools", "workflows", "scheduled", "events", "views",
+                    ),
                     limit=40,
                 )
                 _print_search_page(await api.collect_search(query, all_pages=False))
@@ -3522,15 +3544,24 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
     if not resolved:
         return
 
-    uploaded: list[tuple[str, str, str]] = []  # (kind, filename, remote_path)
+    uploaded: list[dict] = []
     for p in resolved:
         console.print(f"[dim]Uploading {p.name}...[/dim]")
         try:
             form = aiohttp.FormData()
-            form.add_field("file", open(p, "rb"), filename=p.name)
-            async with client._session.post(f"{client.base_url}/api/upload", data=form) as resp:
-                result = await resp.json()
-            uploaded.append((_kind_for(p), result["filename"], result["path"]))
+            with p.open("rb") as upload_file:
+                form.add_field("file", upload_file, filename=p.name)
+                form.add_field("session_id", session_id)
+                form.add_field("kind", _kind_for(p))
+                async with client._session.post(
+                    f"{client.base_url}/api/upload", data=form,
+                ) as resp:
+                    result = await resp.json()
+                    if resp.status >= 400:
+                        raise RuntimeError(
+                            str(result.get("error") or f"upload failed ({resp.status})")
+                        )
+            uploaded.append(dict(result))
         except Exception as e:
             console.print(f"[red]Upload failed for {p.name}: {e}[/red]")
 
@@ -3538,18 +3569,26 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
         return
 
     # Pretty echo of what's being sent
-    _render_attachments([(k, name) for k, name, _ in uploaded])
+    _render_attachments([
+        (
+            str(item.get("type") or item.get("kind") or "file"),
+            str(item.get("filename") or "attachment"),
+        )
+        for item in uploaded
+    ])
 
-    lines = [f"- {k}: {name} — local path: {path}" for k, name, path in uploaded]
     noun = "a file" if len(uploaded) == 1 else f"{len(uploaded)} files"
     inspect = "it" if len(uploaded) == 1 else "them"
     msg = (
-        f"The user attached {noun}:\n"
-        + "\n".join(lines)
-        + f"\nUse the Read tool to inspect {inspect}."
+        f"The user attached {noun}. Inspect {inspect} before answering."
     )
 
-    await _send_message_with_indicator(client, msg, session_id)
+    await _send_message_with_indicator(
+        client,
+        msg,
+        session_id,
+        attachments=uploaded,
+    )
 
 
 def main():

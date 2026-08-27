@@ -23,7 +23,14 @@ ACTIVITY_KINDS = frozenset({
     "scheduled_run",
     "event_delivery",
 })
-SEARCH_SCOPES = frozenset({"chats", "tools", "workflows", "scheduled", "events"})
+SEARCH_SCOPES = frozenset({
+    "chats",
+    "tools",
+    "workflows",
+    "scheduled",
+    "events",
+    "views",
+})
 SEARCH_TARGET_KINDS = frozenset({
     "chat",
     "chat_message",
@@ -34,6 +41,7 @@ SEARCH_TARGET_KINDS = frozenset({
     "scheduled_run",
     "event_definition",
     "event_delivery",
+    "ui_view",
 })
 RUN_STATUSES = frozenset({
     "pending",
@@ -60,6 +68,7 @@ SEARCH_ROOT_KINDS = frozenset({
     "scheduled_run",
     "event_definition",
     "event_delivery",
+    "ui_view",
 })
 ERROR_CODES = frozenset({
     "invalid_request",
@@ -230,8 +239,10 @@ class SearchQuery:
         object.__setattr__(self, "statuses", _validate_values("status", self.statuses, RUN_STATUSES))
         if not self.scopes:
             raise ValueError("at least one explicit search scope is required")
-        if len(self.scopes) > 5:
-            raise ValueError("at most five search scopes are supported")
+        if len(self.scopes) > len(SEARCH_SCOPES):
+            raise ValueError(
+                f"at most {len(SEARCH_SCOPES)} search scopes are supported"
+            )
         if len(self.query) > 4096:
             raise ValueError("query must not exceed 4096 characters")
         if self.sort not in SEARCH_SORTS:
@@ -484,7 +495,7 @@ class RemoteAPIClient:
 
     @classmethod
     def require_global_search_v1(cls, capabilities: Mapping[str, Any] | None) -> None:
-        """Validate the five-scope/nine-target search-v1 contract."""
+        """Validate the six-scope/ten-target search-v1 contract."""
         feature, version = cls._require_feature(capabilities, "global_search", 1)
         cls._require_members(
             feature,
