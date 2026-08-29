@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -114,6 +118,100 @@ def test_frozen_smoke_dispatches_both_sidecars_with_network_binding_and_cleanup(
     assert 'tool="navigate"' in source
     assert 'tool="get_page_text"' in source
     assert "_is_expected_missing_chrome(context)" in source
-    assert '"network_id": f"frozen-cli-network-{pass_number}"' in source
+    assert '"network_id": "frozen-cli-network"' in source
+    assert 'home = Path(root) / "client-home"' in source
+    assert "_spawn_windows_job_process" in source
+    assert "windows_job.terminate(timeout=15)" in source
+    assert "_require_windows_profiles_unlocked(self._home)" in source
     assert '"release_principal"' in source
     assert "page_server.wait_closed()" in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_windows_job_kills_only_its_detached_tree_and_allows_a_clean_second_pass(
+    tmp_path,
+):
+    """Exercise the kernel ownership primitive used around the frozen broker.
+
+    The grandchild uses the same detached flags as Chromium and holds a file
+    open. An unrelated process with the same Python image must survive both Job
+    Object terminations. Reusing the owned path for pass two proves the first
+    tree released its handle rather than merely hiding a stale process.
+    """
+
+    hold_open = (
+        "import os,pathlib,sys,time\n"
+        "handle=open(sys.argv[1],'w')\n"
+        "handle.write(str(os.getpid()))\n"
+        "handle.flush()\n"
+        "pathlib.Path(sys.argv[2]).write_text(str(os.getpid()),encoding='utf-8')\n"
+        "time.sleep(120)\n"
+    )
+    spawn_detached = (
+        "import subprocess,sys\n"
+        "flags=getattr(subprocess,'DETACHED_PROCESS',0) | "
+        "getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)\n"
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2],"
+        "sys.argv[3]],creationflags=flags)\n"
+        "raise SystemExit(child.wait())\n"
+    )
+
+    def wait_ready(path: Path) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.01)
+        raise RuntimeError(f"process tree did not create readiness marker: {path}")
+
+    unrelated_lock = tmp_path / "unrelated.lock"
+    unrelated_ready = tmp_path / "unrelated.ready"
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", hold_open, str(unrelated_lock), str(unrelated_ready)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_ready(unrelated_ready)
+        owned_lock = tmp_path / "owned.lock"
+        for pass_number in range(1, 3):
+            ready = tmp_path / f"owned-{pass_number}.ready"
+            process = None
+            job = None
+            try:
+                process, job = smoke._spawn_windows_job_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        spawn_detached,
+                        hold_open,
+                        str(owned_lock),
+                        str(ready),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                wait_ready(ready)
+                job.terminate(timeout=15)
+                process.wait(timeout=5)
+                assert unrelated.poll() is None
+                # Windows would reject this unlink while the detached holder
+                # still owned the profile-style file handle.
+                owned_lock.unlink()
+            finally:
+                if job is not None:
+                    try:
+                        if process is not None and process.poll() is None:
+                            job.terminate(timeout=15)
+                            process.wait(timeout=5)
+                    finally:
+                        job.close()
+    finally:
+        if unrelated.poll() is None:
+            unrelated.terminate()
+            try:
+                unrelated.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                unrelated.kill()
+                unrelated.wait(timeout=5)

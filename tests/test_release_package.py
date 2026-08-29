@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -55,7 +56,16 @@ def _verify(root: Path) -> subprocess.CompletedProcess[str]:
     uname = tools / "uname"
     uname.write_text("#!/bin/sh\nprintf '%s\\n' x86_64\n", encoding="utf-8")
     uname.chmod(0o755)
-    (tools / "python").symlink_to(Path(sys.executable).resolve())
+    python = tools / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        "case \"${2-}\" in\n"
+        "  *platform.machine*) printf '%s\\n' AMD64; exit 0 ;;\n"
+        "esac\n"
+        f"exec {shlex.quote(str(Path(sys.executable).resolve()))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
     env = os.environ.copy()
     env["RUNNER_OS"] = "Windows"
     env["PATH"] = f"{tools}{os.pathsep}{env['PATH']}"

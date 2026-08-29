@@ -12,7 +12,7 @@
 #               sign-notarize-macos.sh. We just shasum it.
 #   Linux     — tar the bare binary into ``<app>-<ver>-linux-<arch>.tar.gz``
 #               and shasum the archive.
-#   Windows   — zip the ``.exe`` into ``<app>-<ver>-windows-x64.zip`` and
+#   Windows   — zip the ``.exe`` into ``<app>-<ver>-windows-<arch>.zip`` and
 #               shasum the archive. Works under Git Bash on GHA's
 #               windows-latest runner (tar/sha256sum are present; we
 #               shell out to PowerShell for Compress-Archive).
@@ -35,10 +35,15 @@ case "${RUNNER_OS:-$(uname -s)}" in
     *) echo "Unsupported OS: ${RUNNER_OS:-$(uname -s)}" >&2; exit 1 ;;
 esac
 
-ARCH_RAW="$(uname -m)"
+# Git Bash itself can be x64-emulated on a native Windows ARM64 runner, so
+# ``uname -m`` describes Bash rather than the Python/PyInstaller executable we
+# are packaging. The build interpreter is the authoritative binary target on
+# every platform.
+PYTHON_BIN="${PYTHON:-python}"
+ARCH_RAW="$("$PYTHON_BIN" -c 'import platform; print(platform.machine())')"
 case "$ARCH_RAW" in
-    x86_64|amd64)  ARCH="x64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
+    x86_64|amd64|AMD64)  ARCH="x64" ;;
+    aarch64|arm64|ARM64) ARCH="arm64" ;;
     *) ARCH="$ARCH_RAW" ;;
 esac
 
@@ -46,7 +51,6 @@ esac
 # its import packages below ``src/`` but deliberately owns no top-level
 # ``src`` package; importing that name can therefore resolve an unrelated
 # sibling checkout and silently stamp the wrong version into release assets.
-PYTHON_BIN="${PYTHON:-python}"
 VERSION="$("$PYTHON_BIN" -c "from importlib.metadata import version; print(version('openagent-cli'))")"
 
 # The CLI executes the native capability host out-of-process. Keep the

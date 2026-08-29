@@ -29,10 +29,11 @@ case "${RUNNER_OS:-$(uname -s)}" in
         ;;
 esac
 
-release_arch_raw="$(uname -m)"
+release_python="${PYTHON:-python}"
+release_arch_raw="$("$release_python" -c 'import platform; print(platform.machine())')"
 case "$release_arch_raw" in
-    x86_64|amd64)  release_arch="x64" ;;
-    aarch64|arm64) release_arch="arm64" ;;
+    x86_64|amd64|AMD64)  release_arch="x64" ;;
+    aarch64|arm64|ARM64) release_arch="arm64" ;;
     *)             release_arch="$release_arch_raw" ;;
 esac
 

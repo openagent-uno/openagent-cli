@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -86,9 +87,106 @@ def test_windows_arm64_selects_a_published_cryptography_wheel_line():
         assert Version("50.0.1") in normal[0].specifier
 
 
-def test_release_matrix_resolves_cli_and_host_wheel_together_and_gates_browser():
+def test_windows_arm64_iroh_source_is_commit_and_checksum_pinned():
+    lock_path = ROOT / "iroh-source.lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    commit = "4b19fa519f0871a7336772a571b2f0e8091d0b55"
+    assert _sha256(lock_path) == (
+        "8e278800383479f2d7fbe6905c347ded6ed65a1459d5a6403edacdb48c070ac7"
+    )
+    assert lock == {
+        "lock_version": 1,
+        "package": "iroh",
+        "package_version": "0.35.0",
+        "repository": "https://github.com/n0-computer/iroh-ffi",
+        "source_commit": commit,
+        "archive_url": (
+            "https://codeload.github.com/n0-computer/iroh-ffi/tar.gz/" + commit
+        ),
+        "archive_sha256": (
+            "645f7484d688e8f45574ce85c5c13274a6b63bd11bafe86e0ba233e185083b18"
+        ),
+        "rust_toolchain": "1.83.0",
+        "maturin_version": "1.9.6",
+        "uniffi_bindgen_version": "0.28.3",
+    }
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    requirements = [Requirement(value) for value in project["dependencies"]]
+    iroh = [requirement for requirement in requirements if requirement.name == "iroh"]
+    assert len(iroh) == 1
+    assert str(iroh[0].specifier) == "==0.35.0"
+
+    acquire = (ROOT / "scripts" / "acquire-iroh-source.py").read_text()
+    builder = (ROOT / "scripts" / "build-iroh-wheel.py").read_text()
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    tests = (ROOT / ".github" / "workflows" / "test.yml").read_text()
+    assert "codeload.github.com/n0-computer/iroh-ffi/tar.gz/{commit}" in acquire
+    assert "_verify_archive(archive, lock[\"archive_sha256\"])" in acquire
+    assert '"--locked"' in builder
+    assert "host: aarch64-pc-windows-msvc" in builder
+    assert "iroh-0.35.0-py3-none-win_arm64.whl" in builder
+    assert "if: matrix.platform == 'win32-arm64'" in release
+    assert "python scripts/acquire-iroh-source.py" in release
+    assert "python scripts/build-iroh-wheel.py" in release
+    assert "PIP_FIND_LINKS=$IROH_WHEELS" in release
+    assert "runs-on: windows-11-arm" in tests
+    assert "Run two native ARM64 broker and browser passes" in tests
+
+    platforms = {
+        "darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64",
+        "win32-arm64", "win32-x64",
+    }
+    for platform_name in platforms:
+        assert f"platform: {platform_name}" in release
+
+
+def test_iroh_source_acquisition_rejects_checksum_mismatch_and_traversal(tmp_path):
+    archive = tmp_path / "untrusted.tar.gz"
+    archive.write_bytes(b"not the pinned source")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "acquire-iroh-source.py"),
+            "--archive",
+            str(archive),
+            "--output",
+            str(tmp_path / "source"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "Iroh source checksum mismatch" in completed.stderr
+
+    script = ROOT / "scripts" / "acquire-iroh-source.py"
+    spec = importlib.util.spec_from_file_location("acquire_iroh_source", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    commit = "f" * 40
+    traversal = tmp_path / "traversal.tar.gz"
+    with tarfile.open(traversal, "w:gz") as bundle:
+        member = tarfile.TarInfo(f"iroh-ffi-{commit}/../escape")
+        member.type = tarfile.DIRTYPE
+        bundle.addfile(member)
+    try:
+        module._extract(
+            traversal,
+            tmp_path / "traversal-output",
+            {"source_commit": commit, "package_version": "0.35.0"},
+        )
+    except RuntimeError as error:
+        assert "unsafe path" in str(error)
+    else:
+        raise AssertionError("Iroh source traversal was accepted")
+
+
+def test_release_matrix_uses_one_hashed_host_wheel_origin_and_gates_browser():
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-    assert '"$OPENAGENT_HOST_TOOLS_WHEEL"\n          -e . pyinstaller' in workflow
+    assert "python -m pip install\n          -e . pyinstaller" in workflow
+    assert '"$OPENAGENT_HOST_TOOLS_WHEEL"\n          -e . pyinstaller' not in workflow
     assert 'python -m pip install "$OPENAGENT_HOST_TOOLS_WHEEL"' not in workflow
     assert "OPENAGENT_RELEASE_ALLOW_MISSING_CHROME" in workflow
     assert "matrix.platform == 'linux-arm64'" in workflow
@@ -383,6 +481,66 @@ def test_linux_release_packaging_uses_cli_distribution_metadata_in_clean_checkou
         assert "host-tools" in names
         assert "host-tools/bundle-manifest.json" in names
         assert "host-tools/openagent-capability-host" in names
+
+
+def test_windows_arm64_release_name_follows_native_build_python(tmp_path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "openagent-cli.exe").write_bytes(b"frozen-arm64-cli")
+    native = tmp_path / "verified-host-tools"
+    native.mkdir()
+    (native / "bundle-manifest.json").write_text("{}", encoding="utf-8")
+    (native / "openagent-capability-host.exe").write_bytes(b"native-host")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    version = distribution_version("openagent-cli")
+    archive = f"openagent-cli-{version}-windows-arm64.zip"
+    fake_python = fake_bin / "build-python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$2\" in\n"
+        "  *platform.machine*) echo ARM64 ;;\n"
+        f"  *importlib.metadata*) echo {version} ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_powershell = fake_bin / "powershell.exe"
+    fake_powershell.write_text(
+        f"#!/usr/bin/env bash\n: > '{archive}'\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_powershell.chmod(0o755)
+
+    env = {
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PYTHON": str(fake_python),
+        "RUNNER_OS": "Windows",
+        "OPENAGENT_HOST_TOOLS_BUNDLE": str(native),
+    }
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts" / "package-release.sh"),
+            "openagent-cli",
+            str(dist),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (dist / archive).is_file()
+    assert (dist / f"{archive}.sha256").is_file()
+    assert not (dist / f"openagent-cli-{version}-windows-x64.zip").exists()
+
+    verifier = (ROOT / "scripts" / "test-release-package.sh").read_text()
+    assert "platform.machine()" in verifier
+    assert 'release_arch_raw="$(uname -m)"' not in verifier
 
 
 def test_macos_release_fails_closed_and_reads_cli_distribution_version():
