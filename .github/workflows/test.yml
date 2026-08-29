@@ -30,3 +30,42 @@ jobs:
         run: |
           python -m pip install -e . pytest pytest-asyncio
           python -m pytest -q
+
+  windows-frozen-teardown:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Acquire Windows host-tools release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.2-py3-none-any.whl"
+          python scripts/acquire-host-tools.py \
+            --platform win32-x64 \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$HOST_TOOLS_WHEEL"
+          echo "OPENAGENT_HOST_TOOLS_WHEEL=$HOST_TOOLS_WHEEL" >> "$GITHUB_ENV"
+          echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/win32-x64" >> "$GITHUB_ENV"
+      - name: Install frozen-build and regression dependencies
+        shell: bash
+        run: >-
+          python -m pip install
+          "$OPENAGENT_HOST_TOOLS_WHEEL"
+          -e . pyinstaller pytest pytest-asyncio
+      - name: Prove exact Windows Job Object ownership
+        run: >-
+          python -m pytest -q tests/test_frozen_sidecar_smoke.py
+          -k windows_job_kills_only_its_detached_tree
+      - name: Build the frozen Windows CLI
+        env:
+          OPENAGENT_RELEASE_BUILD: '1'
+        run: pyinstaller cli.spec --clean --noconfirm
+      - name: Stage the final Windows package layout
+        shell: bash
+        run: bash scripts/package-release.sh openagent-cli dist
+      - name: Run two broker and browser passes against one profile
+        shell: bash
+        run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli

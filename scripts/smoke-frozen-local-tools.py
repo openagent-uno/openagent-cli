@@ -24,6 +24,11 @@ _PLUGIN_NAME = "release-smoke-plugin"
 _CHROME_MARKER = "OPENAGENT_FROZEN_CLI_CHROME_SMOKE"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_WINDOWS_JOB_LAUNCHER = (
+    "import subprocess,sys\n"
+    "if sys.stdin.buffer.read(1) != b'\\x01': raise SystemExit(125)\n"
+    "raise SystemExit(subprocess.call(sys.argv[1:],stdin=subprocess.DEVNULL))\n"
+)
 _PLUGIN_SOURCE = r'''import json, os, sys
 for line in sys.stdin:
     value = json.loads(line)
@@ -70,17 +75,20 @@ def main() -> None:
         raise SystemExit(f"frozen CLI is missing: {executable}")
     summaries = []
     with tempfile.TemporaryDirectory(prefix="openagent-cli-smoke-") as root:
+        # Reuse the exact broker data and browser profile for both passes. A
+        # second clean launch is therefore evidence that the first teardown
+        # released its singleton, CDP port and every Windows profile handle.
+        home = Path(root) / "client-home"
+        home.mkdir()
+        env = os.environ.copy()
+        env["OPENAGENT_HOST_TOOLS_HOME"] = str(home)
+        # Release packaging stages the immutable bundle beside the executable.
+        # Ignore the CI acquisition path so this smoke proves the distributable
+        # layout rather than a build-machine override.
+        env.pop("OPENAGENT_HOST_TOOLS_BUNDLE", None)
+        env.pop("OPENAGENT_HOST_TOOLS_SIDECAR_DIR", None)
+        _configure_plugin(home)
         for pass_number in range(1, _PASS_COUNT + 1):
-            home = Path(root) / f"pass-{pass_number}"
-            home.mkdir()
-            env = os.environ.copy()
-            env["OPENAGENT_HOST_TOOLS_HOME"] = str(home)
-            # Release packaging stages the immutable bundle beside the executable.
-            # Ignore the CI acquisition path so this smoke proves the distributable
-            # layout rather than a build-machine override.
-            env.pop("OPENAGENT_HOST_TOOLS_BUNDLE", None)
-            env.pop("OPENAGENT_HOST_TOOLS_SIDECAR_DIR", None)
-            _configure_plugin(home)
             summaries.append(_run_pass(executable, env, home, pass_number))
     print("\n\n".join(summaries))
 
@@ -179,20 +187,36 @@ class _FrozenBroker:
         self._env = env
         self._home = home
         self._stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen | None = None
+        self._windows_job: _WindowsJob | None = None
 
     def start(self) -> None:
         if self._process is not None:
             raise RuntimeError("frozen broker was started twice")
-        self._process = subprocess.Popen(
-            [str(self._executable), "--broker"],
-            env=self._env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr,
-            text=True,
-            close_fds=True,
-        )
+        command = [str(self._executable), "--broker"]
+        if os.name == "nt":
+            # A PyInstaller one-file executable is a bootloader plus its real
+            # child process. Launch it below a gated Python root which is put in
+            # a kill-on-close Job Object *before* the frozen broker may start.
+            # Node and detached Chromium descendants then remain owned even if
+            # an intermediate process exits and Windows reparents them.
+            self._process, self._windows_job = _spawn_windows_job_process(
+                command,
+                env=self._env,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr,
+                close_fds=True,
+            )
+        else:
+            self._process = subprocess.Popen(
+                command,
+                env=self._env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr,
+                text=True,
+                close_fds=True,
+            )
         try:
             asyncio.run(_wait_for_broker(self._home, self._process))
         except Exception as exc:
@@ -207,9 +231,19 @@ class _FrozenBroker:
     def close(self) -> None:
         process = self._process
         self._process = None
-        stop_error = None
+        windows_job = self._windows_job
+        self._windows_job = None
+        close_error: BaseException | None = None
         try:
-            if process is not None and process.poll() is None:
+            if windows_job is not None:
+                # TerminateJobObject is scoped to the exact gated tree created
+                # in start(). It waits on an explicit active-process count, so
+                # the broker, Node sidecar and detached Chromium are all gone
+                # before profile/socket assertions run.
+                windows_job.terminate(timeout=15)
+                if process is not None:
+                    process.wait(timeout=5)
+            elif process is not None and process.poll() is None:
                 # Consent revocation has already closed every plugin/sidecar.
                 # This signal is therefore scoped to the exact broker child
                 # owned by this smoke; it cannot affect a user's shared host.
@@ -219,15 +253,25 @@ class _FrozenBroker:
                 except subprocess.TimeoutExpired as exc:
                     process.kill()
                     process.wait(timeout=5)
-                    stop_error = RuntimeError(
+                    close_error = RuntimeError(
                         "frozen broker ignored termination and required exact-child cleanup"
                     )
-                    stop_error.__cause__ = exc
+                    close_error.__cause__ = exc
             asyncio.run(_require_broker_unavailable(self._home))
+            _require_windows_profiles_unlocked(self._home)
+        except BaseException as exc:
+            if close_error is None:
+                close_error = exc
         finally:
+            if windows_job is not None:
+                try:
+                    windows_job.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
             self._stderr.close()
-        if stop_error is not None:
-            raise stop_error
+        if close_error is not None:
+            raise close_error
 
     def stderr_text(self) -> str:
         self._stderr.flush()
@@ -235,9 +279,230 @@ class _FrozenBroker:
         return self._stderr.read()
 
 
+class _WindowsJob:
+    """Own one Windows process tree, including detached descendants."""
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self, process: subprocess.Popen):
+        if os.name != "nt":  # pragma: no cover - protected by the caller
+            raise RuntimeError("Windows Job Objects are only available on Windows")
+
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class BasicAccountingInformation(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        abi_sizes = (
+            ctypes.sizeof(BasicLimitInformation),
+            ctypes.sizeof(ExtendedLimitInformation),
+            ctypes.sizeof(BasicAccountingInformation),
+        )
+        if ctypes.sizeof(ctypes.c_void_p) != 8 or abi_sizes != (64, 144, 48):
+            raise RuntimeError(f"unsupported Windows Job Object ABI: {abi_sizes}")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._ctypes = ctypes
+        self._kernel32 = kernel32
+        self._accounting_type = BasicAccountingInformation
+        self._handle = handle
+        try:
+            limits = ExtendedLimitInformation()
+            limits.BasicLimitInformation.LimitFlags = (
+                self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            if not kernel32.SetInformationJobObject(
+                handle,
+                self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            process_handle = wintypes.HANDLE(int(process._handle))
+            if not kernel32.AssignProcessToJobObject(handle, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            self._handle = None
+            raise
+
+    def terminate(self, *, timeout: float) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        if not self._kernel32.TerminateJobObject(handle, 1):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        deadline = time.monotonic() + timeout
+        while True:
+            accounting = self._accounting_type()
+            if not self._kernel32.QueryInformationJobObject(
+                handle,
+                self._JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                self._ctypes.byref(accounting),
+                self._ctypes.sizeof(accounting),
+                None,
+            ):
+                raise self._ctypes.WinError(self._ctypes.get_last_error())
+            if accounting.ActiveProcesses == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Windows broker Job Object retained {accounting.ActiveProcesses} processes"
+                )
+            # This is bounded polling of the kernel's active-process count, not
+            # a grace-period sleep which could silently leave children alive.
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is not None and not self._kernel32.CloseHandle(handle):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+
+
+def _spawn_windows_job_process(
+    command: list[str],
+    **popen_kwargs,
+) -> tuple[subprocess.Popen, _WindowsJob]:
+    """Gate child creation until its launcher belongs to a Job Object."""
+
+    if os.name != "nt":  # pragma: no cover - exercised by Windows CI
+        raise RuntimeError("Windows Job Object launch requested on a non-Windows host")
+    process = subprocess.Popen(
+        [sys.executable, "-c", _WINDOWS_JOB_LAUNCHER, *command],
+        stdin=subprocess.PIPE,
+        **popen_kwargs,
+    )
+    job: _WindowsJob | None = None
+    try:
+        job = _WindowsJob(process)
+        assert process.stdin is not None
+        process.stdin.write(b"\x01")
+        process.stdin.flush()
+        process.stdin.close()
+        return process, job
+    except BaseException:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if job is not None:
+            try:
+                job.close()
+            except Exception:
+                pass
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
+
+
+def _require_windows_profiles_unlocked(home: Path) -> None:
+    """Prove Chromium released the exact profile files used by the smoke."""
+
+    if os.name != "nt":
+        return
+    principals = home / "host-tools" / "agent-in-chrome" / "principals"
+    for profile in principals.glob("*/profile"):
+        candidates = list(profile.rglob("journal.baj"))
+        candidates.extend(
+            path
+            for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")
+            if (path := profile / name).exists()
+        )
+        # A minimal/brand-new profile may not contain the known Chromium lock
+        # files yet; renaming the profile itself still probes directory handles.
+        if not candidates:
+            candidates.append(profile)
+        for path in candidates:
+            probe = path.with_name(f"{path.name}.openagent-release-unlocked")
+            if probe.exists():
+                raise RuntimeError(f"stale profile unlock probe exists: {probe}")
+            try:
+                path.replace(probe)
+                probe.replace(path)
+            except OSError as exc:
+                if probe.exists() and not path.exists():
+                    try:
+                        probe.replace(path)
+                    except OSError:
+                        pass
+                raise RuntimeError(f"Chromium profile remains locked: {path}") from exc
+
+
 async def _wait_for_broker(
     home: Path,
-    process: subprocess.Popen[str],
+    process: subprocess.Popen,
     *,
     timeout: float = 60.0,
 ) -> None:
@@ -354,11 +619,11 @@ async def _exercise_native_sidecars_through_broker(
 ) -> str:
     """Dispatch both native sidecars through the real frozen broker.
 
-    The browser principal mirrors the trusted fields supplied by the Gateway;
-    its network/account pair is deliberately unique to this temporary smoke
-    home. ``release_principal`` is awaited before the broker is disabled, so
-    the dedicated browser and its reserved CDP port are gone when this
-    function returns.
+    The browser principal mirrors the trusted fields supplied by the Gateway.
+    Its network/account pair is stable across both passes in this temporary
+    home, so pass two must reopen the exact profile closed by pass one.
+    ``release_principal`` is awaited before the broker is disabled; the owned
+    Windows Job Object remains the final fail-closed teardown boundary.
     """
 
     from openagent_host_tools import HostPaths
@@ -368,9 +633,9 @@ async def _exercise_native_sidecars_through_broker(
         "kind": "client",
         "client_instance_id": f"frozen-cli-smoke-{pass_number}",
         "device_label": "Frozen CLI release smoke",
-        "device_id": f"frozen-cli-device-{pass_number}",
-        "account_id": f"frozen-cli-account-{pass_number}",
-        "network_id": f"frozen-cli-network-{pass_number}",
+        "device_id": "frozen-cli-device",
+        "account_id": "frozen-cli-account",
+        "network_id": "frozen-cli-network",
         "generation": pass_number,
     }
     client = LocalBrokerClient(HostPaths.discover(home))
