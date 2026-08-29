@@ -97,15 +97,36 @@ jobs:
             --wheel-output "$HOST_TOOLS_WHEEL"
           echo "OPENAGENT_HOST_TOOLS_WHEEL=$HOST_TOOLS_WHEEL" >> "$GITHUB_ENV"
           echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.platform }}" >> "$GITHUB_ENV"
+      - name: Build checksum-pinned Iroh wheel for Windows ARM64
+        if: matrix.platform == 'win32-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IROH_SOURCE="$RUNNER_TEMP/iroh-ffi"
+          IROH_WHEELS="$RUNNER_TEMP/iroh-wheels"
+          python scripts/acquire-iroh-source.py --output "$IROH_SOURCE"
+          python scripts/build-iroh-wheel.py --source "$IROH_SOURCE" --output "$IROH_WHEELS"
+          echo "PIP_FIND_LINKS=$IROH_WHEELS" >> "$GITHUB_ENV"
       - name: Install CLI deps + PyInstaller
         shell: bash
-        # Resolve the consumer and its pinned producer wheel together. This is
-        # required on Windows ARM64 so the CLI's cryptography wheel constraint
-        # participates before MCP's transitive pyjwt[crypto] dependency.
+        # The project dependency's URL+SHA is the single pip identity for the
+        # producer wheel. The separately acquired copy verifies the release
+        # lock and provides the native bundle, but passing both direct origins
+        # makes modern pip reject them as conflicting requirements. Resolving
+        # from the project still lets its Windows ARM64 cryptography constraint
+        # participate before MCP's transitive pyjwt[crypto] dependency.
         run: >-
           python -m pip install
-          "$OPENAGENT_HOST_TOOLS_WHEEL"
           -e . pyinstaller
+      - name: Verify native Iroh import on Windows ARM64
+        if: matrix.platform == 'win32-arm64'
+        shell: bash
+        run: >-
+          python -c
+          'import iroh, pathlib, platform;
+          assert platform.machine().upper() == "ARM64";
+          assert pathlib.Path(iroh.__file__).is_file();
+          print(iroh.__file__)'
       - name: Build CLI executable
         env:
           OPENAGENT_RELEASE_BUILD: '1'

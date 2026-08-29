@@ -53,7 +53,6 @@ jobs:
         shell: bash
         run: >-
           python -m pip install
-          "$OPENAGENT_HOST_TOOLS_WHEEL"
           -e . pyinstaller pytest pytest-asyncio
       - name: Prove exact Windows Job Object ownership
         run: >-
@@ -67,5 +66,50 @@ jobs:
         shell: bash
         run: bash scripts/package-release.sh openagent-cli dist
       - name: Run two broker and browser passes against one profile
+        shell: bash
+        run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli
+
+  windows-arm64-native-release:
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Acquire checksum-pinned Windows ARM64 inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.2-py3-none-any.whl"
+          python scripts/acquire-host-tools.py \
+            --platform win32-arm64 \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$HOST_TOOLS_WHEEL"
+          python scripts/acquire-iroh-source.py --output "$RUNNER_TEMP/iroh-ffi"
+          echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/win32-arm64" >> "$GITHUB_ENV"
+      - name: Build and expose native Iroh ARM64 wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build-iroh-wheel.py \
+            --source "$RUNNER_TEMP/iroh-ffi" \
+            --output "$RUNNER_TEMP/iroh-wheels"
+          echo "PIP_FIND_LINKS=$RUNNER_TEMP/iroh-wheels" >> "$GITHUB_ENV"
+      - name: Install and verify native CLI dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e . pyinstaller
+          python -c 'import iroh, pathlib, platform; assert platform.machine().upper() == "ARM64"; assert pathlib.Path(iroh.__file__).is_file(); print(iroh.__file__)'
+      - name: Build and stage the frozen Windows ARM64 CLI
+        shell: bash
+        env:
+          OPENAGENT_RELEASE_BUILD: '1'
+        run: |
+          set -euo pipefail
+          pyinstaller cli.spec --clean --noconfirm
+          bash scripts/package-release.sh openagent-cli dist
+      - name: Run two native ARM64 broker and browser passes
         shell: bash
         run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli
