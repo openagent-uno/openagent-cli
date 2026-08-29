@@ -269,6 +269,7 @@ def test_committed_host_tools_lock_and_python_dependency_are_immutable():
         ).read_text(encoding="utf-8")
         assert wheel["asset"] in workflow
         assert "openagent-host-tools.whl" not in workflow
+        assert "pytest-asyncio" in workflow
 
 
 def test_frozen_entrypoint_discovers_external_host_tools_locations():

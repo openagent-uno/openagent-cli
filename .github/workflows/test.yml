@@ -28,5 +28,5 @@ jobs:
           python -m pip install "$HOST_TOOLS_WHEEL"
       - name: Run the full CLI suite
         run: |
-          python -m pip install -e . pytest
+          python -m pip install -e . pytest pytest-asyncio
           python -m pytest -q
