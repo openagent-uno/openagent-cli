@@ -12,6 +12,12 @@ with no ``_internal/`` folder. The CLI bundle is ~13 MB compressed and
 starts in well under a second on every subsequent launch.
 """
 
+from pathlib import Path
+import json
+import os
+import platform
+import sys
+
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 
 # Build-environment guard — see openagent.spec for rationale.
@@ -24,9 +30,11 @@ block_cipher = None
 # the openagent_cli package itself.
 
 hiddenimports = [
-    *collect_submodules("src"),
+    *collect_submodules("openagent_cli"),
+    *collect_submodules("openagent_client_transport"),
     *collect_submodules("rich"),
     *collect_submodules("aiohttp"),
+    *collect_submodules("openagent_host_tools"),
     *collect_submodules("anyio"),
     "click",
     # iroh: see openagent.spec for the full explanation. The CLI uses
@@ -35,10 +43,6 @@ hiddenimports = [
     "iroh",
     "iroh.iroh_ffi",
     *collect_submodules("iroh"),
-    # The CLI imports openagent.network.* (client + iroh_node + transport)
-    # for the loopback flow. We exclude the heavy server modules below
-    # but still need the network subpackage.
-    *collect_submodules("openagent.network"),
     "cbor2",
     "srptools",
     "cryptography",
@@ -50,6 +54,42 @@ hiddenimports = [
 
 datas = []
 datas += collect_data_files("certifi")
+datas += collect_data_files("openagent_host_tools")
+
+# Release builds require the exact native host bundle because the packaging
+# step installs it beside the CLI. Do not put it inside PyInstaller's one-file
+# archive: PyInstaller re-signs nested Mach-O binaries ad hoc, invalidating the
+# bundle checksum and computer-control's stable macOS TCC identity.
+_arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+_platform = {"darwin": "darwin", "linux": "linux", "win32": "win32"}.get(sys.platform)
+if _platform:
+    _configured_bundle = os.environ.get("OPENAGENT_HOST_TOOLS_BUNDLE")
+    _release_build = os.environ.get("OPENAGENT_RELEASE_BUILD") == "1"
+    if _release_build and not _configured_bundle:
+        raise SystemExit(
+            "OPENAGENT_HOST_TOOLS_BUNDLE is required for a release CLI build"
+        )
+    _bundle = (
+        Path(_configured_bundle).resolve()
+        if _configured_bundle
+        else Path("..").resolve() / "openagent-host-tools" / "dist" / f"{_platform}-{_arch}"
+    )
+    if _configured_bundle and not _bundle.is_dir():
+        raise SystemExit(f"configured host-tools bundle does not exist: {_bundle}")
+    if _bundle.is_dir():
+        _manifest_path = _bundle / "bundle-manifest.json"
+        if not _manifest_path.is_file():
+            raise SystemExit(f"host-tools bundle manifest is missing: {_manifest_path}")
+        _manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
+        if (
+            _manifest.get("manifest_version") != 1
+            or _manifest.get("platform") != f"{_platform}-{_arch}"
+            or not isinstance(_manifest.get("files"), dict)
+            or not _manifest["files"]
+        ):
+            raise SystemExit(f"host-tools bundle identity is invalid: {_manifest_path}")
+    elif _release_build:
+        raise SystemExit(f"release host-tools bundle is missing: {_bundle}")
 
 # ── Dynamic libs ──
 # iroh's Rust FFI library (libiroh_ffi.{so,dylib,dll}) — see openagent.spec.
@@ -58,9 +98,9 @@ binaries = collect_dynamic_libs("iroh")
 # ── Analysis ──
 
 a = Analysis(
-    ["src/main.py"],
-    pathex=["."],
-    binaries=[],
+    ["scripts/cli_entry.py"],
+    pathex=["src"],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

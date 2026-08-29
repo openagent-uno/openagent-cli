@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-cli"
-version = "0.15.1"
+version = "0.16.0"
 description = "CLI client for OpenAgent — connects to any OpenAgent Gateway"
 requires-python = ">=3.11"
 license = "MIT"
@@ -13,15 +13,27 @@ dependencies = [
     "aiohttp>=3.9",
     "click>=8.0",
     "rich>=13.0",
-    # The CLI uses ``openagent.network.*`` for the iroh-based loopback
-    # / connect flows. Mirror the server's transport + crypto deps so a
-    # fresh CLI install can dial coordinator endpoints without pulling
-    # in the full openagent server.
+    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.2/openagent_host_tools-0.1.2-py3-none-any.whl#sha256=22e74b799da2bfacaa3ff7f1e473e1c8205c8b4b8c20764d09211b50f22c31e0",
+    # The standalone ``openagent_cli.network`` package implements the
+    # client side of Iroh/certificate transport; ``openagent_client_transport``
+    # carries the checksum-locked stream/capability protocol shared with the
+    # server. Keep dependencies explicit so the wheel remains standalone.
     "iroh==0.35.0",
     "cbor2>=5.6",
     "srptools>=1.0",
     "cryptography>=42",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["openagent_cli*", "openagent_client_transport*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+openagent_client_transport = ["transport-source.json"]
 
 [project.scripts]
 openagent-cli = "openagent_cli.main:main"
