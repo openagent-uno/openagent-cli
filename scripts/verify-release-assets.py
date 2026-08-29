@@ -37,10 +37,16 @@ base = f"openagent-cli-{args.version}"
 expected = {
     f"{base}-linux-x64.tar.gz",
     f"{base}-linux-x64.tar.gz.sha256",
+    f"{base}-linux-arm64.tar.gz",
+    f"{base}-linux-arm64.tar.gz.sha256",
+    f"{base}-macos-x64.pkg",
+    f"{base}-macos-x64.pkg.sha256",
     f"{base}-macos-arm64.pkg",
     f"{base}-macos-arm64.pkg.sha256",
     f"{base}-windows-x64.zip",
     f"{base}-windows-x64.zip.sha256",
+    f"{base}-windows-arm64.zip",
+    f"{base}-windows-arm64.zip.sha256",
 }
 files = [path for path in args.artifacts.rglob("*") if path.is_file()]
 names = [path.name for path in files]

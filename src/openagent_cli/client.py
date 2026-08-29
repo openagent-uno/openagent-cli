@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -38,6 +39,8 @@ _P_COMMAND_RESULT = "command_result"
 _P_STATUS = "status"
 _P_ERROR = "error"
 _P_SESSION_COMPACTED = "session_compacted"
+_CAPABILITY_HELLO_ACK = "capability_hello_ack"
+_CAPABILITY_PROTOCOL = "client-capabilities/1"
 
 TERMINAL_OPEN = "terminal_open"
 TERMINAL_INPUT = "terminal_input"
@@ -122,7 +125,8 @@ def _fold_wire_frame(collector: _StreamCollector, data: dict) -> bool:
 
 def _session_open_frame(session_id: str, *, profile: str, language: str | None,
                         client_kind: str | None, speak: bool = False,
-                        client_capabilities: dict | None = None) -> dict:
+                        client_capabilities: dict | None = None,
+                        client_instance_id: str | None = None) -> dict:
     frame = {
         "type": "session_open",
         "session_id": session_id,
@@ -137,6 +141,8 @@ def _session_open_frame(session_id: str, *, profile: str, language: str | None,
     frame["client_capabilities"] = dict(
         CLI_CLIENT_CAPABILITIES if client_capabilities is None else client_capabilities
     )
+    if client_instance_id:
+        frame["client_instance_id"] = client_instance_id
     return frame
 
 
@@ -211,10 +217,34 @@ class GatewayClient:
         # it owns the foreground; ``None`` the rest of the time.
         self._terminal_cb: Callable[[dict], None] | None = None
         self._listener_task: asyncio.Task | None = None
+        # One opaque process instance binds chat and capability sockets. The
+        # server derives the device from the certificate; this is not a model-
+        # selectable target and is never persisted in the session.
+        self.client_instance_id = uuid.uuid4().hex
+        self._capability_host = None
+        self._capability_bridge = None
+        self._capability_principal: dict | None = None
+        self._capability_ws: aiohttp.ClientWebSocketResponse | None = None
+        self._capability_listener_task: asyncio.Task | None = None
+        self._capability_heartbeat_task: asyncio.Task | None = None
+        self._capability_supervisor_task: asyncio.Task | None = None
+        self._capability_transport_close_task: asyncio.Task | None = None
+        self._capability_generation = 1
+        self._capabilities_stopping = False
         self.agent_name: str | None = None
         self.agent_version: str | None = None
         self.agent_handle: str | None = None
+        self.network_name: str | None = None
         self.network_id: str | None = None
+        self._certified_device_id: str | None = None
+        if dialer is not None:
+            try:
+                cert = dialer.parsed_cert()
+            except Exception:  # noqa: BLE001 - fail closed for local tools
+                logger.warning("could not derive capability identity from device cert")
+            else:
+                self.network_id = cert.network_id
+                self._certified_device_id = cert.device_pubkey_hex
         # Created after auth, and therefore scoped to this exact server,
         # network and principal.  It is in-memory only and is dropped on
         # disconnect so capability/search state cannot cross accounts.
@@ -399,7 +429,17 @@ class GatewayClient:
             self.agent_name = resp.get("agent_name")
             self.agent_version = resp.get("version")
             self.agent_handle = resp.get("handle")
-            self.network_id = resp.get("network")
+            self.network_name = resp.get("network")
+            reported_network_id = resp.get("network_id")
+            if self.network_id is not None:
+                if reported_network_id != self.network_id:
+                    raise ConnectionError(
+                        "gateway authenticated a different network than the device certificate"
+                    )
+            else:
+                # Raw debugging/legacy clients have no certified device to
+                # bind a capability socket, but can still use chat/history.
+                self.network_id = reported_network_id or self.network_name
             from .remote_api import RemoteAPIClient
             embedded = resp.get("capabilities")
             self._remote_api = RemoteAPIClient(
@@ -413,6 +453,7 @@ class GatewayClient:
                 embedded_capabilities=embedded if isinstance(embedded, dict) else None,
             )
             self._listener_task = asyncio.create_task(self._listen())
+            await self._start_local_capabilities()
         except BaseException:
             # Covers auth failure and cancellation while dialing/receiving.
             # Without this, the one-shot REST commands could lose the client
@@ -443,6 +484,7 @@ class GatewayClient:
         return await self.operational_api.collect_search(query, all_pages=all_pages)
 
     async def disconnect(self) -> None:
+        await self._stop_local_capabilities()
         listener = self._listener_task
         self._listener_task = None
         if listener and listener is not asyncio.current_task():
@@ -483,6 +525,276 @@ class GatewayClient:
         self._opened_sessions.clear()
         self._stream_pending.clear()
         self._remote_api = None
+
+    async def _start_local_capabilities(self) -> None:
+        """Offer this interactive CLI computer over the dedicated capability WS.
+
+        Missing host-tools, disabled consent, and older gateways are clean
+        degradations: chat and server-side tools remain available.
+        """
+        try:
+            from openagent_host_tools import LocalCapabilityClient
+        except ImportError:
+            logger.info("openagent-host-tools is not installed; local tools unavailable")
+            return
+
+        if not self.network_id or not self._certified_device_id:
+            logger.info("no certified network/device identity; local tools disabled")
+            return
+        host = LocalCapabilityClient()
+        try:
+            await host.start()
+            self._capability_host = host
+            self._capabilities_stopping = False
+            await self._connect_capabilities_once()
+            self._capability_supervisor_task = asyncio.create_task(
+                self._supervise_capabilities(), name="cli-capability-supervisor"
+            )
+        except Exception as exc:  # noqa: BLE001 - compatibility degradation
+            logger.info("local capability connection unavailable: %s", exc)
+            try:
+                await host.close()
+            except Exception:
+                pass
+            if self._capability_ws is not None:
+                try:
+                    await self._capability_ws.close()
+                except Exception:
+                    pass
+            self._capability_host = None
+            self._capability_bridge = None
+            self._capability_ws = None
+
+    async def _connect_capabilities_once(self) -> bool:
+        host = self._capability_host
+        if host is None or self._session is None or not self.network_id:
+            return False
+        status = await host.status()
+        if not bool((status.get("consent") or {}).get("enabled")):
+            return False
+        base = self.url[:-3] if self.url.endswith("/ws") else self.url.rsplit("/", 1)[0]
+        capability_url = f"{base}/ws/capabilities"
+        ws = await self._session.ws_connect(capability_url)
+        generation = self._capability_generation
+        from openagent_host_tools import CapabilityBridge
+
+        bridge = CapabilityBridge(
+            host,
+            client_instance_id=self.client_instance_id,
+            send_json=ws.send_json,
+            generation=generation,
+            trusted_account_id=self.network_id,
+            trusted_network_id=self.network_id,
+            trusted_device_id=self._certified_device_id,
+            on_transport_lost=lambda: self._schedule_capability_transport_close(
+                ws, bridge
+            ),
+        )
+        self._capability_principal = dict(bridge.principal)
+        try:
+            await bridge.hello()
+            ack_msg = await ws.receive(timeout=10)
+            if ack_msg.type != aiohttp.WSMsgType.TEXT:
+                raise ConnectionError(
+                    "capability gateway closed before hello acknowledgement"
+                )
+            ack = json.loads(ack_msg.data)
+            if (
+                ack.get("type") != _CAPABILITY_HELLO_ACK
+                or ack.get("accepted") is not True
+            ):
+                raise ConnectionError("capability hello rejected")
+            if ack.get("protocol") != _CAPABILITY_PROTOCOL:
+                raise ConnectionError(
+                    "capability hello acknowledged a different protocol"
+                )
+            if ack.get("device_id") != self._certified_device_id:
+                raise ConnectionError("capability hello acknowledged a different device")
+            if ack.get("account_id") != self.network_id:
+                raise ConnectionError("capability hello acknowledged a different account")
+            if ack.get("client_instance_id") != self.client_instance_id:
+                raise ConnectionError(
+                    "capability hello acknowledged a different client instance"
+                )
+            if ack.get("generation") is None or int(ack["generation"]) != generation:
+                raise ConnectionError("capability hello acknowledged a stale generation")
+            self._capability_bridge = bridge
+            self._capability_ws = ws
+            bridge.activate_events()
+        except Exception:
+            if self._capability_bridge is bridge:
+                self._capability_bridge = None
+            if self._capability_ws is ws:
+                self._capability_ws = None
+            await bridge.close()
+            await ws.close()
+            raise
+        self._capability_listener_task = asyncio.create_task(
+            self._listen_capabilities(), name="cli-capability-listener"
+        )
+        self._capability_heartbeat_task = asyncio.create_task(
+            self._heartbeat_capabilities(), name="cli-capability-heartbeat"
+        )
+        return True
+
+    def _schedule_capability_transport_close(self, ws, bridge) -> None:
+        """Close only the capability socket whose local broker was lost."""
+        if self._capabilities_stopping:
+            return
+        active = self._capability_transport_close_task
+        if active is not None and not active.done():
+            return
+
+        async def close_exact_socket() -> None:
+            if self._capability_ws is not ws or self._capability_bridge is not bridge:
+                return
+            try:
+                await ws.close(
+                    code=1011, message=b"local capability host transport lost"
+                )
+            except TypeError:
+                await ws.close()
+            except Exception:
+                logger.debug("failed to close lost capability transport", exc_info=True)
+
+        task = asyncio.create_task(
+            close_exact_socket(), name="cli-capability-host-transport-lost"
+        )
+        self._capability_transport_close_task = task
+
+        def clear(completed: asyncio.Task) -> None:
+            if self._capability_transport_close_task is completed:
+                self._capability_transport_close_task = None
+
+        task.add_done_callback(clear)
+
+    async def _supervise_capabilities(self) -> None:
+        backoff = 0.25
+        try:
+            while not self._capabilities_stopping:
+                active = [
+                    task
+                    for task in (
+                        self._capability_listener_task,
+                        self._capability_heartbeat_task,
+                    )
+                    if task is not None
+                ]
+                if active:
+                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    await self._close_capability_connection(release_principal=False)
+                if self._capabilities_stopping or not self.is_connected:
+                    return
+                await asyncio.sleep(backoff)
+                try:
+                    connected = await self._connect_capabilities_once()
+                except Exception:
+                    connected = False
+                    logger.debug("capability reconnect failed", exc_info=True)
+                backoff = 0.25 if connected else min(backoff * 2, 5.0)
+        except asyncio.CancelledError:
+            raise
+
+    async def _listen_capabilities(self) -> None:
+        ws = self._capability_ws
+        bridge = self._capability_bridge
+        if ws is None or bridge is None:
+            return
+        try:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    break
+                try:
+                    frame = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                await bridge.handle(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("capability listener ended", exc_info=True)
+
+    async def _heartbeat_capabilities(self) -> None:
+        bridge = self._capability_bridge
+        host = self._capability_host
+        if bridge is None or host is None:
+            return
+        last_enabled = True
+        try:
+            while True:
+                await asyncio.sleep(15)
+                status = await host.status()
+                enabled = bool((status.get("consent") or {}).get("enabled"))
+                if enabled != last_enabled:
+                    await bridge.catalog_update()
+                    last_enabled = enabled
+                await bridge.heartbeat()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("capability heartbeat ended", exc_info=True)
+
+    async def _stop_local_capabilities(self) -> None:
+        self._capabilities_stopping = True
+        if self._capability_supervisor_task is not None:
+            self._capability_supervisor_task.cancel()
+            await asyncio.gather(
+                self._capability_supervisor_task, return_exceptions=True
+            )
+            self._capability_supervisor_task = None
+        await self._close_capability_connection(release_principal=False)
+        transport_close = self._capability_transport_close_task
+        if transport_close is not None and transport_close is not asyncio.current_task():
+            transport_close.cancel()
+            await asyncio.gather(transport_close, return_exceptions=True)
+        self._capability_transport_close_task = None
+        if self._capability_host is not None:
+            try:
+                if self._capability_principal is not None:
+                    await self._capability_host.release_principal(
+                        self._capability_principal
+                    )
+            except Exception:
+                pass
+            try:
+                await self._capability_host.close()
+            except Exception:
+                pass
+        self._capability_host = None
+        self._capability_principal = None
+
+    async def _close_capability_connection(
+        self, *, release_principal: bool = False
+    ) -> None:
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in (
+                self._capability_heartbeat_task,
+                self._capability_listener_task,
+            )
+            if task is not None and task is not current
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._capability_heartbeat_task = None
+        self._capability_listener_task = None
+        if self._capability_bridge is not None:
+            try:
+                await self._capability_bridge.close(
+                    release_principals=release_principal
+                )
+            except Exception:
+                pass
+        if self._capability_ws is not None:
+            try:
+                await self._capability_ws.close()
+            except Exception:
+                pass
+        self._capability_bridge = None
+        self._capability_ws = None
 
     async def _listen(self) -> None:
         try:
@@ -599,6 +911,7 @@ class GatewayClient:
                 language=None,
                 client_kind="cli",
                 speak=False,
+                client_instance_id=self.client_instance_id,
             ))
             self._opened_sessions.add(session_id)
 
@@ -668,6 +981,7 @@ class GatewayClient:
             language=language,
             client_kind=client_kind,
             client_capabilities=client_capabilities,
+            client_instance_id=self.client_instance_id,
         ))
 
     async def send_session_close(self, session_id: str) -> None:

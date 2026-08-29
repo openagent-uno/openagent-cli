@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ── OpenAgent CLI Release ──
-# Bumps version in pyproject.toml + src/__init__.py, tags, pushes.
+# Bumps version in pyproject.toml + openagent_cli, refreshes uv.lock, tags,
+# and pushes.
 # CI (.github/workflows/release.yml) builds standalone executables for
 # macOS / Linux / Windows and publishes them to GitHub Releases.
 #
@@ -21,13 +22,19 @@ BUMP="${1:-patch}"
 CURRENT=$(grep 'version = "' "$ROOT/pyproject.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 echo "Current version: $CURRENT"
 
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+BASE_CURRENT="${CURRENT%%-*}"
+IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_CURRENT"
 case "$BUMP" in
   patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
   minor) NEW="$MAJOR.$((MINOR + 1)).0" ;;
   major) NEW="$((MAJOR + 1)).0.0" ;;
   *)     NEW="$BUMP" ;;
 esac
+
+if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+  echo "ERROR: version must be SemVer (optionally -beta.N): $NEW" >&2
+  exit 2
+fi
 
 if [ "$CURRENT" = "$NEW" ]; then
   echo "Version unchanged ($CURRENT). Nothing to do."
@@ -50,15 +57,15 @@ echo
 echo "📦 Bumping $CURRENT → $NEW"
 
 sed -i.bak "s/version = \"[^\"]*\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
-sed -i.bak "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW\"/" "$ROOT/src/__init__.py"
 sed -i.bak "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW\"/" "$ROOT/src/openagent_cli/__init__.py"
-rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/__init__.py.bak" "$ROOT/src/openagent_cli/__init__.py.bak"
+rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/openagent_cli/__init__.py.bak"
+uv lock -P openagent-cli
 
 # ── Commit + tag + push ──
 echo ""
 echo "📤 Committing and tagging v$NEW..."
 
-git add pyproject.toml src/__init__.py src/openagent_cli/__init__.py
+git add pyproject.toml src/openagent_cli/__init__.py uv.lock
 git commit -m "release: v$NEW"
 git tag "v$NEW" -m "v$NEW"
 

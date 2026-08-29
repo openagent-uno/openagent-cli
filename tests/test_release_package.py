@@ -16,6 +16,8 @@ APP = "openagent-cli"
 VERSION = "0.16.0-beta.1"
 ARCHIVE_NAME = f"{APP}-{VERSION}-windows-x64.zip"
 EXECUTABLE_NAME = f"{APP}.exe"
+HOST_MANIFEST = "host-tools/bundle-manifest.json"
+HOST_EXECUTABLE = "host-tools/openagent-capability-host.exe"
 EXECUTABLE = b"""#!/bin/sh
 case "${1-}" in
     --version) printf '%s\\n' 'openagent-cli, version 0.16.0-beta.1' ;;
@@ -30,6 +32,8 @@ def _write_archive(root: Path, extra_entries: dict[str, bytes] | None = None) ->
     archive_path = root / ARCHIVE_NAME
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(EXECUTABLE_NAME, EXECUTABLE)
+        archive.writestr(HOST_MANIFEST, b"{}")
+        archive.writestr(HOST_EXECUTABLE, b"host")
         for name, payload in (extra_entries or {}).items():
             archive.writestr(name, payload)
     digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
@@ -85,7 +89,25 @@ class WindowsReleasePackageTests(unittest.TestCase):
             result = _verify(root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unexpected ZIP entries", result.stderr)
+        self.assertIn("unexpected ZIP entry", result.stderr)
+
+    def test_rejects_a_missing_host_tools_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / ARCHIVE_NAME
+            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(EXECUTABLE_NAME, EXECUTABLE)
+                archive.writestr(HOST_EXECUTABLE, b"host")
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            (root / f"{ARCHIVE_NAME}.sha256").write_text(
+                f"{digest}  {ARCHIVE_NAME}\n",
+                encoding="utf-8",
+            )
+
+            result = _verify(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing ZIP entries", result.stderr)
 
     def test_rejects_a_path_traversal_entry(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14,8 +14,11 @@ VERSION = "0.16.0-beta.1"
 BASE = f"openagent-cli-{VERSION}"
 PRIMARY = (
     f"{BASE}-linux-x64.tar.gz",
+    f"{BASE}-linux-arm64.tar.gz",
+    f"{BASE}-macos-x64.pkg",
     f"{BASE}-macos-arm64.pkg",
     f"{BASE}-windows-x64.zip",
+    f"{BASE}-windows-arm64.zip",
 )
 
 
@@ -54,7 +57,7 @@ class ReleaseAssetVerificationTests(unittest.TestCase):
             result = _verify(root)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("verified 6 immutable CLI release assets", result.stdout)
+        self.assertIn("verified 12 immutable CLI release assets", result.stdout)
 
     def test_rejects_target_hidden_in_nested_path(self):
         with tempfile.TemporaryDirectory() as directory:

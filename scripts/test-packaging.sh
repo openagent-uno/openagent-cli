@@ -25,6 +25,7 @@ mkdir -p "$packaging_tmp/source"
 cp "$packaging_root/pyproject.toml" "$packaging_root/cli.spec" "$packaging_tmp/source/"
 mkdir -p "$packaging_tmp/source/src" "$packaging_tmp/source/scripts"
 cp -R "$packaging_root/src/openagent_cli" "$packaging_tmp/source/src/"
+cp -R "$packaging_root/src/openagent_client_transport" "$packaging_tmp/source/src/"
 cp "$packaging_root/scripts/cli_entry.py" "$packaging_tmp/source/scripts/"
 
 cd "$packaging_tmp/source"
@@ -43,7 +44,9 @@ for packaging_required in \
   openagent_cli/main.py \
   openagent_cli/client.py \
   openagent_cli/remote_api.py \
-  openagent_cli/network/client/session.py; do
+  openagent_cli/network/client/session.py \
+  openagent_client_transport/transport-source.json \
+  openagent_client_transport/network/client/session.py; do
   grep -Fxq "$packaging_required" "$packaging_contents"
 done
 if grep -Eq '^(__init__|main|client|remote_api)\.py$' "$packaging_contents"; then
@@ -72,6 +75,8 @@ import openagent_cli.client
 import openagent_cli.main
 import openagent_cli.network.client.session
 import openagent_cli.remote_api
+import openagent_client_transport
+import openagent_client_transport.network.client.session
 
 venv = pathlib.Path(sys.argv[1]).resolve()
 package_file = pathlib.Path(openagent_cli.__file__).resolve()

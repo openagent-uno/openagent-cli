@@ -73,10 +73,56 @@ case "$release_os" in
             exit 1
         }
         IFS= read -r release_binary < "$release_candidates"
+        release_manifest_candidates="$release_tmp/manifest-candidates.txt"
+        find "$release_tmp/pkg" -type f \
+            -path '*/usr/local/lib/openagent/host-tools/bundle-manifest.json' \
+            -print > "$release_manifest_candidates"
+        release_manifest_count="$(wc -l < "$release_manifest_candidates" | tr -d ' ')"
+        [[ "$release_manifest_count" == "1" ]] || {
+            echo "expected one host-tools manifest in pkg, found $release_manifest_count" >&2
+            exit 1
+        }
+        IFS= read -r release_host_manifest < "$release_manifest_candidates"
         ;;
     linux)
-        tar -xzf "$release_archive" -C "$release_tmp"
+        python - "$release_archive" "$release_tmp" "$release_app" <<'PY'
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+
+archive_path, destination, expected_name = sys.argv[1:]
+with tarfile.open(archive_path, "r:gz") as archive:
+    members = archive.getmembers()
+    names: set[str] = set()
+    for member in members:
+        name = member.name.rstrip("/")
+        path = PurePosixPath(name)
+        if (
+            not name
+            or "\\" in name
+            or path.is_absolute()
+            or ".." in path.parts
+            or str(path) != name
+        ):
+            raise SystemExit(f"unsafe tar entry: {member.name!r}")
+        if not (member.isfile() or member.isdir()):
+            raise SystemExit(f"unsupported tar entry: {member.name!r}")
+        if name in names:
+            raise SystemExit(f"duplicate tar entry: {member.name!r}")
+        names.add(name)
+        if name != expected_name and name != "host-tools" and not name.startswith(
+            "host-tools/"
+        ):
+            raise SystemExit(f"unexpected tar entry: {member.name!r}")
+
+    required = {expected_name, "host-tools/bundle-manifest.json"}
+    if not required.issubset(names):
+        raise SystemExit(f"missing tar entries: {sorted(required - names)!r}")
+    archive.extractall(destination, members=members)
+PY
         release_binary="$release_tmp/$release_app"
+        release_host_manifest="$release_tmp/host-tools/bundle-manifest.json"
         ;;
     windows)
         python - "$release_archive" "$release_tmp" "${release_app}.exe" <<'PY'
@@ -93,29 +139,50 @@ with zipfile.ZipFile(archive_path) as archive:
         raise SystemExit(f"corrupt ZIP entry: {corrupt_entry!r}")
 
     files: list[str] = []
+    seen: set[str] = set()
     expected_entry = None
     for entry in archive.infolist():
         normalized = entry.filename.replace("\\", "/")
-        path = PurePosixPath(normalized)
-        if path.is_absolute() or ".." in path.parts:
+        name = normalized.rstrip("/")
+        path = PurePosixPath(name)
+        if (
+            not name
+            or path.is_absolute()
+            or ".." in path.parts
+            or str(path) != name
+        ):
             raise SystemExit(f"unsafe ZIP entry: {entry.filename!r}")
+        if name in seen:
+            raise SystemExit(f"duplicate ZIP entry: {entry.filename!r}")
+        seen.add(name)
+        if name != expected_name and name != "host-tools" and not name.startswith(
+            "host-tools/"
+        ):
+            raise SystemExit(f"unexpected ZIP entry: {entry.filename!r}")
         if entry.is_dir():
             continue
-        files.append(normalized)
-        if normalized == expected_name:
+        files.append(name)
+        if name == expected_name:
             expected_entry = entry
 
-    expected = {expected_name}
-    if set(files) != expected or len(files) != len(expected):
-        raise SystemExit(f"unexpected ZIP entries: {sorted(files)!r}")
+    required = {expected_name, "host-tools/bundle-manifest.json"}
+    if not required.issubset(files):
+        raise SystemExit(f"missing ZIP entries: {sorted(required - set(files))!r}")
     if expected_entry is None:
         raise SystemExit(f"missing ZIP entry: {expected_name!r}")
 
-    target = Path(destination) / expected_name
-    with archive.open(expected_entry) as source, target.open("wb") as output:
-        shutil.copyfileobj(source, output)
+    for entry in archive.infolist():
+        normalized = entry.filename.replace("\\", "/").rstrip("/")
+        target = Path(destination) / PurePosixPath(normalized)
+        if entry.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(entry) as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
 PY
         release_binary="$release_tmp/${release_app}.exe"
+        release_host_manifest="$release_tmp/host-tools/bundle-manifest.json"
         chmod +x "$release_binary"
         ;;
 esac
@@ -126,6 +193,10 @@ esac
 }
 [[ -x "$release_binary" ]] || {
     echo "extracted CLI is not executable: $release_binary" >&2
+    exit 1
+}
+[[ -f "$release_host_manifest" ]] || {
+    echo "final package does not contain the host-tools manifest" >&2
     exit 1
 }
 

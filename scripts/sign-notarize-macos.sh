@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/sign-notarize-macos.sh <binary>
 #   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path>
-#   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path> <extra-sidecar-binary>
+#   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path> <extra-sidecar-binary> <extra-runtime-directory>
 #
 # Examples:
 #   # Sign + notarize the bare binary only (no .pkg):
@@ -68,9 +68,10 @@ BINARY="${1:-}"
 PKG_IDENTIFIER="${2:-}"
 PKG_INSTALL_PATH="${3:-}"
 EXTRA_SIDECAR="${4:-}"
+EXTRA_RUNTIME_DIR="${5:-}"
 
 if [ -z "$BINARY" ]; then
-    echo "usage: $0 <binary-or-app-bundle> [pkg-identifier pkg-install-path [extra-sidecar-binary]]" >&2
+    echo "usage: $0 <binary-or-app-bundle> [pkg-identifier pkg-install-path [extra-sidecar-binary [extra-runtime-directory]]]" >&2
     exit 2
 fi
 
@@ -90,6 +91,17 @@ fi
 if [ -n "$EXTRA_SIDECAR" ] && [ ! -f "$EXTRA_SIDECAR" ]; then
     echo "sidecar binary not a file: $EXTRA_SIDECAR" >&2
     exit 2
+fi
+
+if [ -n "$EXTRA_RUNTIME_DIR" ]; then
+    if [ ! -d "$EXTRA_RUNTIME_DIR" ]; then
+        echo "extra runtime directory not found: $EXTRA_RUNTIME_DIR" >&2
+        exit 2
+    fi
+    if [ ! -f "$EXTRA_RUNTIME_DIR/bundle-manifest.json" ]; then
+        echo "extra runtime manifest not found: $EXTRA_RUNTIME_DIR/bundle-manifest.json" >&2
+        exit 2
+    fi
 fi
 
 WANT_PKG=false
@@ -115,8 +127,6 @@ if [ "$WANT_PKG" = true ]; then
     # ``import openagent.app`` tries to resolve a non-existent
     # ``openagent.app`` submodule and the build fails.
     PKG_BASE="${BINARY_NAME%.app}"
-    MODULE="src"
-    RELEASE_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
     PKG_VERSION="$(python -c "from importlib.metadata import version; print(version('openagent-cli'))")"
     PKG_ARCH_RAW="$(uname -m)"
     case "$PKG_ARCH_RAW" in
@@ -124,12 +134,16 @@ if [ "$WANT_PKG" = true ]; then
         aarch64|arm64) PKG_ARCH="arm64" ;;
         *) PKG_ARCH="$PKG_ARCH_RAW" ;;
     esac
-    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${RELEASE_VERSION}-macos-${PKG_ARCH}.pkg"
+    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
 fi
 
 # ── Skip cleanly when the binary-signing secrets are missing ──────────
 
 if [ -z "${CSC_LINK:-}" ] || [ -z "${CSC_KEY_PASSWORD:-}" ]; then
+    if [ "${OPENAGENT_REQUIRE_SIGNING:-0}" = "1" ]; then
+        echo "ERROR: CSC_LINK / CSC_KEY_PASSWORD are required for this release" >&2
+        exit 1
+    fi
     echo "⚠️  CSC_LINK / CSC_KEY_PASSWORD not set — skipping macOS signing"
     exit 0
 fi
@@ -286,6 +300,10 @@ echo "✓ Binary signed"
 # ── Notarize + (for .app bundles) staple ──────────────────────────────
 
 if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+    if [ "${OPENAGENT_REQUIRE_SIGNING:-0}" = "1" ]; then
+        echo "ERROR: APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID are required for this release" >&2
+        exit 1
+    fi
     echo "⚠️  APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID not set"
     echo "   — binary is signed but NOT notarized. Manual downloads will"
     echo "     still trigger Gatekeeper on first launch."
@@ -359,6 +377,16 @@ else
     chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 fi
 
+# The frozen CLI discovers this stable installed location at runtime. Use
+# ditto rather than codesign/cp so the already signed and checksum-verified
+# producer bundle is copied without altering nested app metadata or xattrs.
+if [ -n "$EXTRA_RUNTIME_DIR" ]; then
+    RUNTIME_DEST="$PKG_ROOT/usr/local/lib/openagent/host-tools"
+    echo "→ Adding verified host-tools runtime at /usr/local/lib/openagent/host-tools"
+    mkdir -p "$RUNTIME_DEST"
+    ditto "$EXTRA_RUNTIME_DIR" "$RUNTIME_DEST"
+fi
+
 UNSIGNED_PKG="${RUNNER_TEMP:-/tmp}/$(basename "$PKG_OUTPUT" .pkg)-unsigned.pkg"
 echo "→ Building unsigned .pkg with identifier $PKG_IDENTIFIER"
 # ``pkgbuild`` produces a "component" pkg. --install-location / tells it
@@ -378,6 +406,14 @@ productsign \
     "$UNSIGNED_PKG" \
     "$PKG_OUTPUT"
 pkgutil --check-signature "$PKG_OUTPUT"
+
+if [ -n "$EXTRA_RUNTIME_DIR" ]; then
+    if ! pkgutil --payload-files "$PKG_OUTPUT" \
+        | grep -Eq '(^|\./)usr/local/lib/openagent/host-tools/bundle-manifest\.json$'; then
+        echo "ERROR: signed pkg is missing the host-tools runtime payload" >&2
+        exit 1
+    fi
+fi
 
 echo "→ Notarizing .pkg"
 xcrun notarytool submit "$PKG_OUTPUT" \

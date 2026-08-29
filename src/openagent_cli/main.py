@@ -56,6 +56,32 @@ if False:  # TYPE_CHECKING placeholder — satisfies IDEs without importing
 console = Console()
 
 
+def _configure_frozen_host_tools() -> None:
+    """Locate the checksum-verified native bundle shipped beside the CLI."""
+
+    if not getattr(sys, "frozen", False) or os.environ.get(
+        "OPENAGENT_HOST_TOOLS_SIDECAR_DIR"
+    ):
+        return
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates: list[Path] = []
+    configured = os.environ.get("OPENAGENT_HOST_TOOLS_BUNDLE")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend(
+        [
+            executable_dir / "host-tools",
+            executable_dir.parent / "lib" / "openagent" / "host-tools",
+        ]
+    )
+    for candidate in candidates:
+        if (candidate / "bundle-manifest.json").is_file():
+            os.environ["OPENAGENT_HOST_TOOLS_SIDECAR_DIR"] = str(
+                candidate.resolve()
+            )
+            return
+
+
 # ── Tool-status formatter (inlined to avoid coupling to openagent package) ──
 
 def format_tool_status(raw: str) -> str:
@@ -518,6 +544,117 @@ def _print_help() -> None:
 def cli():
     """OpenAgent CLI — connect to any OpenAgent Gateway."""
     pass
+
+
+@cli.group("local-tools")
+def local_tools_group():
+    """Manage persistent device-level access to this computer."""
+    pass
+
+
+@local_tools_group.command("enable")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the consent confirmation")
+def local_tools_enable(assume_yes: bool):
+    """Allow interactive OpenAgent turns unrestricted local computer access."""
+    if not assume_yes:
+        console.print(
+            "[yellow]This grants interactive OpenAgent turns unrestricted access to this "
+            "computer's files, shell, editor, and enabled local MCPs.[/yellow]"
+        )
+        if not Confirm.ask(
+            "Enable persistent local tools for this device?", default=False
+        ):
+            console.print("[dim]No changes.[/dim]")
+            return
+    asyncio.run(_set_local_tools(True))
+
+
+@local_tools_group.command("disable")
+def local_tools_disable():
+    """Revoke local computer access immediately for this device."""
+    asyncio.run(_set_local_tools(False))
+
+
+@local_tools_group.command("status")
+def local_tools_status():
+    """Show consent, broker health, built-ins and configured local MCPs."""
+    asyncio.run(_show_local_tools_status())
+
+
+async def _open_local_tools_client():
+    try:
+        from openagent_host_tools import LocalCapabilityClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "openagent-host-tools is not installed; reinstall or update openagent-cli"
+        ) from exc
+    client = LocalCapabilityClient()
+    await client.start()
+    return client
+
+
+async def _set_local_tools(enabled: bool) -> None:
+    client = None
+    try:
+        client = await _open_local_tools_client()
+        await client.set_consent(enabled)
+        status = await client.status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not update local tools:[/red] {exc}")
+        return
+    finally:
+        if client is not None:
+            await client.close()
+    if enabled:
+        available = sum(
+            1 for item in status.get("servers", []) if item.get("available")
+        )
+        console.print(
+            f"[green]Local tools enabled persistently.[/green] "
+            f"{available} module(s) available."
+        )
+    else:
+        console.print(
+            "[green]Local tools disabled.[/green] Active local calls were revoked."
+        )
+
+
+async def _show_local_tools_status() -> None:
+    client = None
+    try:
+        client = await _open_local_tools_client()
+        status = await client.status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not read local tools status:[/red] {exc}")
+        return
+    finally:
+        if client is not None:
+            await client.close()
+    consent = status.get("consent") or {}
+    state = "enabled" if consent.get("enabled") else "disabled"
+    colour = "green" if consent.get("enabled") else "yellow"
+    console.print(f"Local tools: [{colour}]{state}[/{colour}]")
+    console.print(f"[dim]Consent: {status.get('consent_path')}[/dim]")
+    console.print(f"[dim]MCP config: {status.get('config_path')}[/dim]")
+    table = Table(show_header=True)
+    table.add_column("Module")
+    table.add_column("Source")
+    table.add_column("Health")
+    table.add_column("Tools", justify="right")
+    for item in status.get("servers", []):
+        available = bool(item.get("available"))
+        health = (
+            "[green]available[/green]"
+            if available
+            else f"[dim]{item.get('unavailable_reason') or 'unavailable'}[/dim]"
+        )
+        table.add_row(
+            str(item.get("name")),
+            str(item.get("source", "builtin")),
+            health,
+            str(len(item.get("tools") or [])),
+        )
+    console.print(table)
 
 
 @cli.command()
@@ -3592,6 +3729,13 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
 
 
 def main():
+    _configure_frozen_host_tools()
+    # The local broker can re-exec the frozen CLI with a private stdio mode.
+    if getattr(sys, "frozen", False) and sys.argv[1:2] in (["--broker"], ["--direct"]):
+        from openagent_host_tools.stdio import main as host_tools_main
+
+        host_tools_main()
+        return
     cli()
 
 

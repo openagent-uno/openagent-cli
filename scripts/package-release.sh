@@ -26,8 +26,6 @@ set -euo pipefail
 APP="${1:?usage: $0 <app> <dist-dir>}"
 DIST="${2:?usage: $0 <app> <dist-dir>}"
 
-MODULE="src"
-
 # ── Detect OS and arch in release-filename convention ────────────────
 
 case "${RUNNER_OS:-$(uname -s)}" in
@@ -44,12 +42,37 @@ case "$ARCH_RAW" in
     *) ARCH="$ARCH_RAW" ;;
 esac
 
-# Resolve the version from the installed Python package. Runs in the
-# repo root (the CI job's default cwd) so PyInstaller's dist/ tree
-# can't shadow the import.
-# Keep exact external SemVer spelling (for example ``0.16.0-beta.1``) in
-# release filenames. Python distribution metadata is allowed to normalize it.
-VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+# Resolve the version from installed distribution metadata.  The CLI keeps
+# its import packages below ``src/`` but deliberately owns no top-level
+# ``src`` package; importing that name can therefore resolve an unrelated
+# sibling checkout and silently stamp the wrong version into release assets.
+PYTHON_BIN="${PYTHON:-python}"
+VERSION="$("$PYTHON_BIN" -c "from importlib.metadata import version; print(version('openagent-cli'))")"
+
+# The CLI executes the native capability host out-of-process. Keep the
+# producer-built bundle outside PyInstaller's one-file archive so nested
+# Mach-O signatures, the manifest hashes, and the stable TCC identity remain
+# byte-for-byte intact. The macOS installer receives the same directory in
+# sign-notarize-macos.sh; Linux and Windows archives stage it here beside the
+# executable.
+if [ "$APP" = "openagent-cli" ]; then
+    HOST_TOOLS_SOURCE="${OPENAGENT_HOST_TOOLS_BUNDLE:-}"
+    if [ -z "$HOST_TOOLS_SOURCE" ] || [ ! -d "$HOST_TOOLS_SOURCE" ]; then
+        echo "ERROR: OPENAGENT_HOST_TOOLS_BUNDLE must name the verified native bundle" >&2
+        exit 1
+    fi
+    if [ ! -f "$HOST_TOOLS_SOURCE/bundle-manifest.json" ]; then
+        echo "ERROR: host-tools bundle manifest is missing: $HOST_TOOLS_SOURCE" >&2
+        exit 1
+    fi
+    HOST_TOOLS_STAGE="$DIST/host-tools"
+    if [ -e "$HOST_TOOLS_STAGE" ]; then
+        echo "ERROR: refusing to overwrite staged host-tools directory: $HOST_TOOLS_STAGE" >&2
+        exit 1
+    fi
+    mkdir -p "$HOST_TOOLS_STAGE"
+    cp -R "$HOST_TOOLS_SOURCE/." "$HOST_TOOLS_STAGE/"
+fi
 
 # Unified SHA-256 helper — macOS has ``shasum``, Linux/Git Bash have
 # ``sha256sum``. ``shasum -a 256`` on macOS and ``sha256sum`` on Linux
@@ -82,15 +105,17 @@ case "$OS" in
         BIN="$APP"
         [ -f "$BIN" ] || { echo "ERROR: $PWD/$BIN missing (PyInstaller output)" >&2; ls -la; exit 1; }
         chmod +x "$BIN"
-        # Bundle the computer-control sidecar alongside the openagent
-        # server. The sidecar lives outside the PyInstaller archive so
-        # its Developer-ID signature (macOS) or ad-hoc bits (Linux) stay
-        # intact. Only applies to the server — ``openagent-cli`` has no
-        # MCP runtime and doesn't need it.
+        # Bundle native helpers beside their frozen executable. They remain
+        # external to PyInstaller so their producer manifest stays valid.
         FILES=("$BIN")
         if [ "$APP" = "openagent" ] && [ -f "openagent-computer-control" ]; then
             chmod +x "openagent-computer-control"
             FILES+=("openagent-computer-control")
+        elif [ "$APP" = "openagent-cli" ]; then
+            [ -f "host-tools/bundle-manifest.json" ] || {
+                echo "ERROR: $PWD/host-tools is incomplete" >&2; exit 1;
+            }
+            FILES+=("host-tools")
         fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.tar.gz"
         tar czf "$ARCHIVE" "${FILES[@]}"
@@ -105,6 +130,11 @@ case "$OS" in
         FILES=("$BIN")
         if [ "$APP" = "openagent" ] && [ -f "openagent-computer-control.exe" ]; then
             FILES+=("openagent-computer-control.exe")
+        elif [ "$APP" = "openagent-cli" ]; then
+            [ -f "host-tools/bundle-manifest.json" ] || {
+                echo "ERROR: $PWD/host-tools is incomplete" >&2; exit 1;
+            }
+            FILES+=("host-tools")
         fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.zip"
         # Git Bash doesn't ship a ``zip`` binary on GHA's windows-latest,
