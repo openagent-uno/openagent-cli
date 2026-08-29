@@ -263,6 +263,12 @@ def test_committed_host_tools_lock_and_python_dependency_are_immutable():
     assert f"#sha256={wheel['sha256']}" in pyproject
     assert "[tool.uv.sources]" not in pyproject
     assert "../openagent-host-tools" not in pyproject
+    for workflow_name in ("test.yml", "release.yml"):
+        workflow = (
+            ROOT / ".github" / "workflows" / workflow_name
+        ).read_text(encoding="utf-8")
+        assert wheel["asset"] in workflow
+        assert "openagent-host-tools.whl" not in workflow
 
 
 def test_frozen_entrypoint_discovers_external_host_tools_locations():

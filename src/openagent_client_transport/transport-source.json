@@ -16,13 +16,13 @@
     "network/user_store.py": "36b8232cc84ac6207b8af74c5ba54d7e30c4257d25c98eb4681f532695b1fc91",
     "stream/__init__.py": "ac1c3c288d4a530b2c20b9459a4fd2d89916416f08f2a9f049d9c72bed2f5f70",
     "stream/collector.py": "23e2c24af54a14bca3da03f283ef800b78216f4ca8b849faeb73e696100cdacb",
-    "stream/events.py": "a2916d43923939534ff579ee0fbe714ce324f51e62bc71a463ec4cb668fced5a",
+    "stream/events.py": "d032c259dfc6a5a374011cbba0bec24ac09bc4b031f76c1df7a07a0f176a7b6b",
     "stream/protocol.py": "872e15b896ccea6a59db6687bb2818501330e539e899e4b8c471446783909a0a",
     "stream/reply.py": "a0419f1e5108f46e7089d3ce3401e05ba369c5181ad4433911f061f826fb914c",
-    "stream/wire.py": "37957be82a38e76b12ef4a9b5ae9bd4396589be605be4023f4cd6fdeb3b6bdf0"
+    "stream/wire.py": "a290af09883c77a2c1f4e9b31c7e4043c2a3e763ec9b96529554017fcdc33ae1"
   },
   "schema": 1,
-  "source_commit": "72882742b6acfc242cef7eb92f9cdd80f589fc44",
+  "source_commit": "2ce3204cc23fb3dad8070dbf8f3b8f0dc4b4eba6",
   "source_files": {
     "src/network/auth/device_cert.py": "da0fe386ec4f1bbcbd2cd4fa7ed40e5d56e4fe99d9fa727276fcdc42bdba7adc",
     "src/network/client/login.py": "1a72be0ef1feecd77c7e489205122af3ddd0641842f7fa9fc385d1e030205ed1",
@@ -33,8 +33,8 @@
     "src/network/ticket.py": "b3abf1671e32be9eeca548d027be31623705a45a8090188fb0d2a764b467558c",
     "src/network/user_store.py": "3ffd4477c2042865762b7325fb69358b154da3549a25528ff7231bdf04d45447",
     "src/stream/collector.py": "e83845f08a6652b5720fc133484af10e6655ea72f2341a6dc9ce6d134f6af240",
-    "src/stream/events.py": "41f12b29d8f150364b9909834a7d923575995eebe9d9fb060f7792cadff784f9",
-    "src/stream/wire.py": "a480b5e64d6408f8773a5ac1c06dcc0624ba3caacf304b16730e38fe5b4c8a2d"
+    "src/stream/events.py": "6dad990136f3e12e2f06f20e66994e246db86000091c52a67fd1d9a7553f1f64",
+    "src/stream/wire.py": "543463cd9dc5614f745741ba07dc18cc403e55e5d91663fc726b58c9ad9e40e3"
   },
   "source_repository": "https://github.com/openagent-uno/openagent-server"
 }
