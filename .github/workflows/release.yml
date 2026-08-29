@@ -99,9 +99,13 @@ jobs:
           echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.platform }}" >> "$GITHUB_ENV"
       - name: Install CLI deps + PyInstaller
         shell: bash
-        run: |
-          python -m pip install "$OPENAGENT_HOST_TOOLS_WHEEL"
-          python -m pip install -e . pyinstaller
+        # Resolve the consumer and its pinned producer wheel together. This is
+        # required on Windows ARM64 so the CLI's cryptography wheel constraint
+        # participates before MCP's transitive pyjwt[crypto] dependency.
+        run: >-
+          python -m pip install
+          "$OPENAGENT_HOST_TOOLS_WHEEL"
+          -e . pyinstaller
       - name: Build CLI executable
         env:
           OPENAGENT_RELEASE_BUILD: '1'
@@ -142,6 +146,11 @@ jobs:
         run: bash scripts/package-release.sh openagent-cli dist
       - name: Smoke frozen broker twice, explicit plugin, and five-module catalog
         shell: bash
+        env:
+          # GitHub's Linux ARM64 image has no Chromium package. The smoke still
+          # launches and calls the real sidecar, accepting only its exact
+          # no-browser prerequisite error; all other targets must navigate/read.
+          OPENAGENT_RELEASE_ALLOW_MISSING_CHROME: ${{ matrix.platform == 'linux-arm64' && '1' || '0' }}
         run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli
       - name: Verify checksum and extracted final package
         shell: bash

@@ -76,6 +76,36 @@ def test_headless_linux_has_an_explicit_display_denial_allowlist(monkeypatch):
     )
 
 
+def test_missing_chrome_is_allowed_only_for_opted_in_linux_arm64(monkeypatch):
+    missing = _text_result(
+        "Error: Could not launch any Chromium-based browser (tried: none). "
+        "Install Google Chrome or set OPENAGENT_CHROME_BINARY.",
+        is_error=True,
+    )
+    monkeypatch.setenv("OPENAGENT_RELEASE_ALLOW_MISSING_CHROME", "1")
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    monkeypatch.setattr(smoke.platform, "machine", lambda: "aarch64")
+    assert smoke._is_expected_missing_chrome(missing) is True
+
+    monkeypatch.delenv("OPENAGENT_RELEASE_ALLOW_MISSING_CHROME")
+    assert smoke._is_expected_missing_chrome(missing) is False
+    monkeypatch.setenv("OPENAGENT_RELEASE_ALLOW_MISSING_CHROME", "1")
+    monkeypatch.setattr(smoke.platform, "machine", lambda: "x86_64")
+    assert smoke._is_expected_missing_chrome(missing) is False
+
+
+def test_missing_chrome_gate_rejects_found_or_broken_browser(monkeypatch):
+    monkeypatch.setenv("OPENAGENT_RELEASE_ALLOW_MISSING_CHROME", "1")
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    monkeypatch.setattr(smoke.platform, "machine", lambda: "arm64")
+    found_but_broken = _text_result(
+        "Could not launch any Chromium-based browser (tried: chromium). "
+        "Last error: process crashed",
+        is_error=True,
+    )
+    assert smoke._is_expected_missing_chrome(found_but_broken) is False
+
+
 def test_frozen_smoke_dispatches_both_sidecars_with_network_binding_and_cleanup():
     source = SCRIPT.read_text(encoding="utf-8")
     assert '_exercise_computer_control(client, principal, pass_number)' in source
@@ -83,6 +113,7 @@ def test_frozen_smoke_dispatches_both_sidecars_with_network_binding_and_cleanup(
     assert 'server="agent-in-chrome"' in source
     assert 'tool="navigate"' in source
     assert 'tool="get_page_text"' in source
+    assert "_is_expected_missing_chrome(context)" in source
     assert '"network_id": f"frozen-cli-network-{pass_number}"' in source
     assert '"release_principal"' in source
     assert "page_server.wait_closed()" in source
