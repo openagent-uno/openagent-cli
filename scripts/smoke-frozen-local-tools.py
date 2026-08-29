@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
 import queue
@@ -18,6 +20,9 @@ from pathlib import Path
 
 _PASS_COUNT = 2
 _PLUGIN_NAME = "release-smoke-plugin"
+_CHROME_MARKER = "OPENAGENT_FROZEN_CLI_CHROME_SMOKE"
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 _PLUGIN_SOURCE = r'''import json, os, sys
 for line in sys.stdin:
     value = json.loads(line)
@@ -87,6 +92,8 @@ def _run_pass(
 ) -> str:
     broker = _FrozenBroker(executable, env, home)
     broker.start()
+    output = ""
+    sidecar_summary = "not-run"
     try:
         enabled = _run(executable, env, "enable", "--yes")
         completed = _run(executable, env, "status")
@@ -98,13 +105,21 @@ def _run_pass(
             raise RuntimeError(f"frozen local-tools status failed:\n{output}")
         _validate_catalog_output(output)
         asyncio.run(_exercise_plugin_through_broker(home, pass_number))
-        disabled = _run(executable, env, "disable")
-        disable_output = disabled.stdout + "\n" + disabled.stderr
-        if disabled.returncode != 0 or "Could not update local tools" in disable_output:
-            raise RuntimeError(f"frozen local-tools disable failed:\n{disable_output}")
-        asyncio.run(_require_disabled_broker(home, pass_number))
+        sidecar_summary = asyncio.run(
+            _exercise_native_sidecars_through_broker(home, pass_number)
+        )
     finally:
-        broker.close()
+        # Revoke consent even when a native sidecar assertion failed. The
+        # nested finally still reaps the exact broker child if the frozen CLI
+        # cannot process the revocation request.
+        try:
+            disabled = _run(executable, env, "disable")
+            disable_output = disabled.stdout + "\n" + disabled.stderr
+            if disabled.returncode != 0 or "Could not update local tools" in disable_output:
+                raise RuntimeError(f"frozen local-tools disable failed:\n{disable_output}")
+            asyncio.run(_require_disabled_broker(home, pass_number))
+        finally:
+            broker.close()
 
     # The direct entrypoint verifies that the same frozen package exposes the
     # embedded adapter with identical filesystem/editor/shell semantics. It is
@@ -112,7 +127,10 @@ def _run_pass(
     # two hosts never contend for the durable ledger or mutation lease.
     _exercise_frozen_host(executable, env, home, pass_number)
     asyncio.run(_require_broker_unavailable(home))
-    return f"Frozen local-tools release smoke pass {pass_number}/{_PASS_COUNT}:\n{output.strip()}"
+    return (
+        f"Frozen local-tools release smoke pass {pass_number}/{_PASS_COUNT}:\n"
+        f"{output.strip()}\nNative broker dispatch: {sidecar_summary}"
+    )
 
 
 def _validate_catalog_output(output: str) -> None:
@@ -176,8 +194,13 @@ class _FrozenBroker:
         )
         try:
             asyncio.run(_wait_for_broker(self._home, self._process))
-        except Exception:
+        except Exception as exc:
+            stderr = self.stderr_text().strip()
             self.close()
+            if stderr:
+                raise RuntimeError(
+                    f"frozen broker failed readiness: {exc}; stderr:\n{stderr}"
+                ) from exc
             raise
 
     def close(self) -> None:
@@ -215,7 +238,7 @@ async def _wait_for_broker(
     home: Path,
     process: subprocess.Popen[str],
     *,
-    timeout: float = 15.0,
+    timeout: float = 60.0,
 ) -> None:
     from openagent_host_tools import HostPaths
     from openagent_host_tools.local_broker import LocalBrokerClient
@@ -266,10 +289,17 @@ async def _require_broker_unavailable(
     raise RuntimeError(f"a broker residue still accepts connections for {home}")
 
 
-async def _broker_request(client, request_id: str, request_type: str, **fields) -> dict:
+async def _broker_request(
+    client,
+    request_id: str,
+    request_type: str,
+    *,
+    timeout: float = 30.0,
+    **fields,
+) -> dict:
     await client.send({"id": request_id, "type": request_type, **fields})
     while True:
-        response = await asyncio.wait_for(client.receive(), timeout=30)
+        response = await asyncio.wait_for(client.receive(), timeout=timeout)
         if response is None:
             raise RuntimeError(f"frozen broker disconnected during {request_type}")
         if str(response.get("id")) == request_id:
@@ -315,6 +345,295 @@ async def _exercise_plugin_through_broker(home: Path, pass_number: int) -> None:
             raise RuntimeError(f"explicit plugin lost client execution location: {result}")
     finally:
         await client.close()
+
+
+async def _exercise_native_sidecars_through_broker(
+    home: Path,
+    pass_number: int,
+) -> str:
+    """Dispatch both native sidecars through the real frozen broker.
+
+    The browser principal mirrors the trusted fields supplied by the Gateway;
+    its network/account pair is deliberately unique to this temporary smoke
+    home. ``release_principal`` is awaited before the broker is disabled, so
+    the dedicated browser and its reserved CDP port are gone when this
+    function returns.
+    """
+
+    from openagent_host_tools import HostPaths
+    from openagent_host_tools.local_broker import LocalBrokerClient
+
+    principal = {
+        "kind": "client",
+        "client_instance_id": f"frozen-cli-smoke-{pass_number}",
+        "device_label": "Frozen CLI release smoke",
+        "device_id": f"frozen-cli-device-{pass_number}",
+        "account_id": f"frozen-cli-account-{pass_number}",
+        "network_id": f"frozen-cli-network-{pass_number}",
+        "generation": pass_number,
+    }
+    client = LocalBrokerClient(HostPaths.discover(home))
+    await client.connect()
+    primary_error: BaseException | None = None
+    try:
+        computer = await _exercise_computer_control(client, principal, pass_number)
+        await _exercise_agent_in_chrome(client, principal, pass_number)
+        return f"computer-control({computer}); agent-in-chrome(navigate+read=granted)"
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        # A large or malformed frame can poison this StreamReader. Close it
+        # first, then use a fresh broker connection for explicit principal
+        # release; the server also releases the principal on disconnect.
+        await client.close()
+        cleanup_client = LocalBrokerClient(HostPaths.discover(home))
+        try:
+            await cleanup_client.connect()
+            released = await _broker_request(
+                cleanup_client,
+                f"sidecar-release-{pass_number}",
+                "release_principal",
+                timeout=60,
+                principal=principal,
+            )
+            if released.get("ok") is not True or not (
+                released.get("result") or {}
+            ).get("released"):
+                raise RuntimeError(
+                    f"frozen broker did not release its native sidecars: {released}"
+                )
+        except BaseException:
+            if primary_error is None:
+                raise
+        finally:
+            await cleanup_client.close()
+
+
+async def _broker_tool_call(
+    client,
+    *,
+    principal: dict,
+    server: str,
+    tool: str,
+    args: dict,
+    call_id: str,
+    timeout: float = 90.0,
+) -> dict:
+    response = await _broker_request(
+        client,
+        f"request-{call_id}",
+        "call",
+        timeout=timeout,
+        server=server,
+        tool=tool,
+        args=args,
+        principal=principal,
+        call_id=call_id,
+        idempotency_key=call_id,
+    )
+    if response.get("ok") is not True:
+        raise RuntimeError(f"frozen {server}.{tool} broker dispatch failed: {response}")
+    result = response.get("result") or {}
+    if result.get("_meta", {}).get("openagent/location") != "client":
+        raise RuntimeError(f"frozen {server}.{tool} lost client location: {result}")
+    return result
+
+
+async def _exercise_computer_control(
+    client,
+    principal: dict,
+    pass_number: int,
+) -> str:
+    cursor = await _broker_tool_call(
+        client,
+        principal=principal,
+        server="computer-control",
+        tool="computer",
+        args={"action": "get_cursor_position"},
+        call_id=f"frozen-computer-cursor-{pass_number}",
+    )
+    cursor_outcome = _validate_computer_result(cursor, "get_cursor_position")
+    if cursor_outcome != "granted":
+        # Accessibility/display is a prerequisite for the screenshot because
+        # computer-control draws the cursor crosshair into the captured image.
+        # Do not hammer a denied native helper with a redundant second probe;
+        # the exact OS denial above already proves real broker dispatch.
+        return f"cursor={cursor_outcome}, screenshot=skipped-after-os-denial"
+    screenshot = await _broker_tool_call(
+        client,
+        principal=principal,
+        server="computer-control",
+        tool="computer",
+        args={"action": "get_screenshot"},
+        call_id=f"frozen-computer-screenshot-{pass_number}",
+    )
+    screenshot_outcome = _validate_computer_result(screenshot, "get_screenshot")
+    return f"cursor={cursor_outcome}, screenshot={screenshot_outcome}"
+
+
+def _validate_computer_result(result: dict, action: str) -> str:
+    if result.get("isError") is True:
+        text = _tool_result_text(result).lower()
+        markers = _allowed_computer_denials(action)
+        if not markers or not any(marker in text for marker in markers):
+            raise RuntimeError(
+                f"unexpected computer-control {action} denial on {sys.platform}: "
+                f"{_tool_result_text(result) or result!r}"
+            )
+        return "expected-os-denial"
+
+    if action == "get_cursor_position":
+        for item in result.get("content") or []:
+            if item.get("type") != "text":
+                continue
+            try:
+                value = json.loads(str(item.get("text") or ""))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and all(
+                isinstance(value.get(axis), int) and not isinstance(value.get(axis), bool)
+                for axis in ("x", "y")
+            ):
+                return "granted"
+        raise RuntimeError(f"computer-control returned invalid cursor coordinates: {result}")
+
+    for item in result.get("content") or []:
+        if item.get("type") != "image" or item.get("mimeType") != "image/png":
+            continue
+        try:
+            payload = base64.b64decode(item.get("data") or "", validate=True)
+        except (TypeError, ValueError, binascii.Error) as exc:
+            raise RuntimeError("computer-control returned invalid base64 PNG data") from exc
+        if not payload.startswith(_PNG_SIGNATURE) or not payload.endswith(_PNG_IEND):
+            raise RuntimeError("computer-control returned an invalid or truncated PNG")
+        return "granted"
+    raise RuntimeError(f"computer-control returned no PNG screenshot: {result}")
+
+
+def _allowed_computer_denials(action: str) -> tuple[str, ...]:
+    if sys.platform == "darwin":
+        if action == "get_cursor_position":
+            return ("macos accessibility permission required",)
+        return (
+            "macos accessibility permission required",
+            "macos screen recording permission required",
+        )
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        # Headless source/test jobs are allowed to prove the native dispatch
+        # boundary by reaching one of these stable display failures. Release
+        # jobs with Xvfb/Wayland are not: when a display is advertised, both
+        # calls must produce real coordinates/pixels.
+        return (
+            "enigo init failed",
+            "xopendisplay",
+            "failed to establish x11 connection",
+            "xcap::monitor::all failed",
+            "no monitors detected",
+            "wayland connection",
+        )
+    # Windows release runners are interactive desktops. A denial there, or on
+    # Linux with an advertised display, is a release failure rather than an
+    # accepted environment limitation.
+    return ()
+
+
+def _tool_result_text(result: dict) -> str:
+    return "\n".join(
+        str(item.get("text") or "")
+        for item in result.get("content") or []
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+
+
+async def _chrome_smoke_page(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    try:
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        body = (
+            "<!doctype html><meta charset=utf-8><title>OpenAgent CLI smoke</title>"
+            f'<main id="marker">{_CHROME_MARKER}</main>'
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+
+
+async def _exercise_agent_in_chrome(
+    client,
+    principal: dict,
+    pass_number: int,
+) -> None:
+    page_server = await asyncio.start_server(_chrome_smoke_page, "127.0.0.1", 0)
+    assert page_server.sockets
+    page_port = int(page_server.sockets[0].getsockname()[1])
+    try:
+        context = await _broker_tool_call(
+            client,
+            principal=principal,
+            server="agent-in-chrome",
+            tool="tabs_context_mcp",
+            args={"createIfEmpty": True},
+            call_id=f"frozen-chrome-context-{pass_number}",
+        )
+        _require_tool_success(context, "agent-in-chrome tab discovery")
+        try:
+            first_line = _tool_result_text(context).splitlines()[0]
+            tab_id = json.loads(first_line)["availableTabs"][0]["tabId"]
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"frozen agent-in-chrome returned invalid tab context: {context}"
+            ) from exc
+        if not isinstance(tab_id, int) or isinstance(tab_id, bool):
+            raise RuntimeError(f"frozen agent-in-chrome returned invalid tab id: {tab_id!r}")
+
+        navigated = await _broker_tool_call(
+            client,
+            principal=principal,
+            server="agent-in-chrome",
+            tool="navigate",
+            args={"url": f"http://127.0.0.1:{page_port}/smoke", "tabId": tab_id},
+            call_id=f"frozen-chrome-navigate-{pass_number}",
+        )
+        _require_tool_success(navigated, "agent-in-chrome navigation")
+        page = await _broker_tool_call(
+            client,
+            principal=principal,
+            server="agent-in-chrome",
+            tool="get_page_text",
+            args={"tabId": tab_id},
+            call_id=f"frozen-chrome-read-{pass_number}",
+        )
+        _require_tool_success(page, "agent-in-chrome page read")
+        if _CHROME_MARKER not in _tool_result_text(page):
+            raise RuntimeError(
+                "frozen agent-in-chrome did not read the deterministic local page: "
+                f"{_tool_result_text(page)!r}"
+            )
+    finally:
+        page_server.close()
+        await page_server.wait_closed()
+
+
+def _require_tool_success(result: dict, label: str) -> None:
+    if result.get("isError") is True:
+        raise RuntimeError(f"frozen {label} failed: {_tool_result_text(result) or result!r}")
 
 
 async def _require_disabled_broker(home: Path, pass_number: int) -> None:
