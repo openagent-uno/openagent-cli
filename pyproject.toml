@@ -13,7 +13,7 @@ dependencies = [
     "aiohttp>=3.9",
     "click>=8.0",
     "rich>=13.0",
-    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.0/openagent_host_tools-0.1.0-py3-none-any.whl#sha256=415f294201edacdf5b71d635df8e4f910f60b43d4c2afb92b8bfe29a11d20a84",
+    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.1/openagent_host_tools-0.1.1-py3-none-any.whl#sha256=74977320f43033fe18bf9bd58c710823886c0f348c94bb36766627b4037c2e88",
     # The CLI uses ``openagent.network.*`` for the iroh-based loopback
     # / connect flows. Mirror the server's transport + crypto deps so a
     # fresh CLI install can dial coordinator endpoints without pulling

@@ -754,20 +754,20 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "cryptography", specifier = ">=42" },
     { name = "iroh", specifier = "==0.35.0" },
-    { name = "openagent-host-tools", url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.0/openagent_host_tools-0.1.0-py3-none-any.whl" },
+    { name = "openagent-host-tools", url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.1/openagent_host_tools-0.1.1-py3-none-any.whl" },
     { name = "rich", specifier = ">=13.0" },
     { name = "srptools", specifier = ">=1.0" },
 ]
 
 [[package]]
 name = "openagent-host-tools"
-version = "0.1.0"
-source = { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.0/openagent_host_tools-0.1.0-py3-none-any.whl" }
+version = "0.1.1"
+source = { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.1/openagent_host_tools-0.1.1-py3-none-any.whl" }
 dependencies = [
     { name = "mcp" },
 ]
 wheels = [
-    { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.0/openagent_host_tools-0.1.0-py3-none-any.whl", hash = "sha256:415f294201edacdf5b71d635df8e4f910f60b43d4c2afb92b8bfe29a11d20a84" },
+    { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.1/openagent_host_tools-0.1.1-py3-none-any.whl", hash = "sha256:74977320f43033fe18bf9bd58c710823886c0f348c94bb36766627b4037c2e88" },
 ]
 
 [package.metadata]

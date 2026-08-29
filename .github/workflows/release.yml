@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.1-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform linux-x64 \
             --output "$RUNNER_TEMP/openagent-host-tools" \
@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.1-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform '${{ matrix.platform }}' \
             --output "$RUNNER_TEMP/openagent-host-tools" \
