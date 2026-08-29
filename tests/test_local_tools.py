@@ -564,6 +564,7 @@ async def test_cli_broker_loss_reconnects_same_generation_and_retries_safe_call(
 
     first_broker = await spawn_broker()
     second_broker = None
+    socket_path = LocalBrokerServer(paths).unix_socket_path
     control = LocalCapabilityClient(paths)
     await control.start()
     await control.set_consent(True)
@@ -734,8 +735,19 @@ async def test_cli_broker_loss_reconnects_same_generation_and_retries_safe_call(
         await control.close()
         await runner.cleanup()
         if first_broker.returncode is None:
-            first_broker.kill()
-            await first_broker.wait()
+            first_broker.terminate()
+            try:
+                await asyncio.wait_for(first_broker.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                first_broker.kill()
+                await first_broker.wait()
         if second_broker is not None and second_broker.returncode is None:
-            second_broker.kill()
-            await second_broker.wait()
+            second_broker.terminate()
+            try:
+                await asyncio.wait_for(second_broker.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                second_broker.kill()
+                await second_broker.wait()
+        stale_socket = socket_path.exists()
+        socket_path.unlink(missing_ok=True)
+    assert not stale_socket, "graceful replacement broker shutdown left a Unix socket"
