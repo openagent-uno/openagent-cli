@@ -1,0 +1,10 @@
+"""Stable Gateway constants needed by the client stream codec."""
+
+MESSAGE = "message"
+STATUS = "status"
+DELTA = "delta"
+RESPONSE = "response"
+ERROR = "error"
+AUDIO_START = "audio_start"
+AUDIO_CHUNK = "audio_chunk"
+AUDIO_END = "audio_end"

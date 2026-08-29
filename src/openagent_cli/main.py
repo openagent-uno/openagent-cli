@@ -1,39 +1,49 @@
-"""Console entrypoint for the source-checkout CLI.
-
-The current monorepo keeps the CLI's historical modules under a package
-named ``src`` while the framework also exposes its internals through
-``src.*``. In an editable checkout those two packages collide. This shim
-loads the CLI package first, then extends its package search path with the
-sibling server's ``src`` directory so imports like ``src.client`` and
-``src.network`` can coexist. It also aliases ``openagent`` to that combined
-package for the CLI's compatibility imports.
-"""
+"""Installed and frozen OpenAgent CLI entrypoint."""
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 
-def _prepare_source_checkout() -> None:
-    cli_root = Path(__file__).resolve().parents[2]
-    server_src = cli_root.parent / "openagent-server" / "src"
+def _configure_frozen_host_tools() -> None:
+    """Locate the checksum-verified native bundle shipped beside the CLI.
 
-    cli_root_s = str(cli_root)
-    if cli_root_s not in sys.path:
-        sys.path.insert(0, cli_root_s)
+    Native helpers deliberately stay outside PyInstaller's one-file archive:
+    PyInstaller re-signs nested Mach-O files ad hoc, which would invalidate the
+    producer manifest and destroy computer-control's stable TCC identity.
+    """
 
-    import src  # noqa: PLC0415
-
-    server_src_s = str(server_src)
-    if server_src.exists() and server_src_s not in src.__path__:
-        src.__path__.append(server_src_s)
-    sys.modules.setdefault("openagent", src)
+    if not getattr(sys, "frozen", False) or os.environ.get(
+        "OPENAGENT_HOST_TOOLS_SIDECAR_DIR"
+    ):
+        return
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates = []
+    configured = os.environ.get("OPENAGENT_HOST_TOOLS_BUNDLE")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend(
+        [
+            executable_dir / "host-tools",
+            executable_dir.parent / "lib" / "openagent" / "host-tools",
+        ]
+    )
+    for candidate in candidates:
+        if (candidate / "bundle-manifest.json").is_file():
+            os.environ["OPENAGENT_HOST_TOOLS_SIDECAR_DIR"] = str(candidate.resolve())
+            return
 
 
 def main() -> None:
-    _prepare_source_checkout()
+    _configure_frozen_host_tools()
+    from openagent_cli.legacy_main import main as cli_main
 
-    from src.main import main as legacy_main  # noqa: PLC0415
+    cli_main()
 
-    legacy_main()
+
+if __name__ == "__main__":
+    # PyInstaller executes this file as its script entrypoint; unlike the
+    # setuptools console-script wrapper there is nobody else to call main().
+    main()

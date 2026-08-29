@@ -1,0 +1,40 @@
+{
+  "generated_files": {
+    "__init__.py": "7e25307048731281398cca3b6097417c322ec5f30e7134e867f6218004b9b7b6",
+    "helpers.py": "886342887500d33b2da70a0535e680802977b479c0a44bb7fa096d3931e84d5c",
+    "network/__init__.py": "1603b5ec4b3855c61bb08edee84e348af6b3fe4e08a295d0fbfb8ea8b253d185",
+    "network/auth/__init__.py": "2d85c941576d456b503a0925d225ec9a279dcfcea669c8033a30637b1b130a61",
+    "network/auth/device_cert.py": "bcaacc1e7beb6ff7fcbd1e88d725120d642fd9b4981b532784c7260c15e57703",
+    "network/client/__init__.py": "3e31b305f103d4850125b3305023b12b9c07ba377fe27d09c3508b5f856de290",
+    "network/client/login.py": "ff801ff68319036fbada0d76706ebba25c8a26a6b2a769633a4378f093e01742",
+    "network/client/session.py": "b582401a2a3eda948a0a5c02f83b2d57021475d4a2152d811bb50facb2e341e5",
+    "network/coordinator/__init__.py": "3b356c7fdbc2fe0c36e28d52afe33816ff501e05f5ecf14af86cfedfc721b45f",
+    "network/coordinator/pake.py": "eb24578f82070011f0b1ca7d83b2b16419009caa0a04bc1d6f9cba067f8327c4",
+    "network/identity.py": "22413835607ec3c2b1ecba2dcf47d5f960717e4a1c80dbcb813a2d7e6f37eb98",
+    "network/iroh_node.py": "ce9a0035d68689d9053dd7188f0b19bc09e63a90e577c9135049086d532d9f9a",
+    "network/ticket.py": "015755d7fa54d8edbe40b0ab69095bfd876028c2bec0a641c2cd905112cbeee9",
+    "network/user_store.py": "36b8232cc84ac6207b8af74c5ba54d7e30c4257d25c98eb4681f532695b1fc91",
+    "stream/__init__.py": "ac1c3c288d4a530b2c20b9459a4fd2d89916416f08f2a9f049d9c72bed2f5f70",
+    "stream/collector.py": "23e2c24af54a14bca3da03f283ef800b78216f4ca8b849faeb73e696100cdacb",
+    "stream/events.py": "a2916d43923939534ff579ee0fbe714ce324f51e62bc71a463ec4cb668fced5a",
+    "stream/protocol.py": "872e15b896ccea6a59db6687bb2818501330e539e899e4b8c471446783909a0a",
+    "stream/reply.py": "a0419f1e5108f46e7089d3ce3401e05ba369c5181ad4433911f061f826fb914c",
+    "stream/wire.py": "37957be82a38e76b12ef4a9b5ae9bd4396589be605be4023f4cd6fdeb3b6bdf0"
+  },
+  "schema": 1,
+  "source_commit": "72882742b6acfc242cef7eb92f9cdd80f589fc44",
+  "source_files": {
+    "src/network/auth/device_cert.py": "da0fe386ec4f1bbcbd2cd4fa7ed40e5d56e4fe99d9fa727276fcdc42bdba7adc",
+    "src/network/client/login.py": "1a72be0ef1feecd77c7e489205122af3ddd0641842f7fa9fc385d1e030205ed1",
+    "src/network/client/session.py": "bda4adf92dfb0e50b5ca2f51070e2cdba66ab8d85c5e9fc7c07d5c7c6842dd65",
+    "src/network/coordinator/pake.py": "161b91490efdebab10733a8fa023872b9aa946b32321298267633f8932dd9b50",
+    "src/network/identity.py": "fb7693e0c6cc4c6346ad7f7dad1c29d792ec83762c3d6ac225621c70fc1c1e16",
+    "src/network/iroh_node.py": "84debd31a1ab1b6a5d86ed9f218ac335df6fc0bf4dd072ab9b21f6e8bed39d63",
+    "src/network/ticket.py": "b3abf1671e32be9eeca548d027be31623705a45a8090188fb0d2a764b467558c",
+    "src/network/user_store.py": "3ffd4477c2042865762b7325fb69358b154da3549a25528ff7231bdf04d45447",
+    "src/stream/collector.py": "e83845f08a6652b5720fc133484af10e6655ea72f2341a6dc9ce6d134f6af240",
+    "src/stream/events.py": "41f12b29d8f150364b9909834a7d923575995eebe9d9fb060f7792cadff784f9",
+    "src/stream/wire.py": "a480b5e64d6408f8773a5ac1c06dcc0624ba3caacf304b16730e38fe5b4c8a2d"
+  },
+  "source_repository": "https://github.com/openagent-uno/openagent-server"
+}

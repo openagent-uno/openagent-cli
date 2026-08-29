@@ -11,33 +11,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Callable
 
 import aiohttp
 
-from openagent.network import user_store
-from openagent.network.client.session import LoopbackProxy, SessionDialer
-from openagent.network.identity import (
+from openagent_client_transport.network import user_store
+from openagent_client_transport.network.client.session import LoopbackProxy, SessionDialer
+from openagent_client_transport.network.identity import (
     Identity,
     load_or_create_identity,
 )
-from openagent.network.iroh_node import IrohNode
-from openagent.stream.collector import StreamCollector, fold_outbound_event
-from openagent.stream.events import (
+from openagent_client_transport.network.iroh_node import IrohNode
+from openagent_client_transport.stream.collector import StreamCollector, fold_outbound_event
+from openagent_client_transport.stream.events import (
     AudioChunk, Interrupt, SessionClose, SessionOpen, TextFinal, now_ms,
 )
-from openagent.stream.wire import event_to_wire, wire_to_event
+from openagent_client_transport.stream.wire import event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
 
-# Gateway + terminal protocol frame types — mirroring ``src/gateway/protocol.py``
-# on the server. Defined locally rather than imported from
-# ``openagent.gateway.protocol`` so the CLI keeps working against any gateway
-# snapshot and avoids a circular namespace conflict: the installed
-# openagent.gateway.protocol does ``from src.gateway.commands import COMMANDS``
-# at module level (it expects to run inside the server repo where ``src`` == the
-# server source), which blows up when PYTHONPATH contains the CLI's ``src/``
-# instead.  String literals are the stable contract; no import needed.
+# Gateway + terminal frame types are stable public wire strings. Keeping this
+# small set local prevents a thin CLI build from importing server commands.
 _P_AUTH = "auth"
 _P_AUTH_ERROR = "auth_error"
 _P_COMMAND = "command"
@@ -45,6 +40,9 @@ _P_COMMAND_RESULT = "command_result"
 _P_STATUS = "status"
 _P_ERROR = "error"
 _P_SESSION_COMPACTED = "session_compacted"
+
+_CAPABILITY_HELLO_ACK = "capability_hello_ack"
+_CAPABILITY_PROTOCOL = "client-capabilities/1"
 
 TERMINAL_OPEN = "terminal_open"
 TERMINAL_INPUT = "terminal_input"
@@ -111,10 +109,37 @@ class GatewayClient:
         # it owns the foreground; ``None`` the rest of the time.
         self._terminal_cb: Callable[[dict], None] | None = None
         self._listener_task: asyncio.Task | None = None
+        # One opaque instance id binds this interactive chat socket to the
+        # separate /ws/capabilities socket. It is never a device selector or a
+        # fallback: the gateway verifies both sockets from the same device cert.
+        self.client_instance_id = uuid.uuid4().hex
+        self._capability_host = None
+        self._capability_bridge = None
+        self._capability_principal: dict | None = None
+        self._capability_ws: aiohttp.ClientWebSocketResponse | None = None
+        self._capability_listener_task: asyncio.Task | None = None
+        self._capability_heartbeat_task: asyncio.Task | None = None
+        self._capability_supervisor_task: asyncio.Task | None = None
+        self._capability_transport_close_task: asyncio.Task | None = None
+        # Stable for this process. A transport reconnect is the same execution
+        # host: retaining the generation lets the Gateway transfer background
+        # shell correlation instead of treating the process as a replacement.
+        self._capability_generation = 1
+        self._capabilities_stopping = False
         self.agent_name: str | None = None
         self.agent_version: str | None = None
         self.agent_handle: str | None = None
+        self.network_name: str | None = None
         self.network_id: str | None = None
+        self._certified_device_id: str | None = None
+        if dialer is not None:
+            try:
+                cert = dialer.parsed_cert()
+            except Exception:  # noqa: BLE001 - disables capabilities fail-closed
+                logger.warning("could not derive capability identity from device cert")
+            else:
+                self.network_id = cert.network_id
+                self._certified_device_id = cert.device_pubkey_hex
 
     @classmethod
     async def from_network(
@@ -137,9 +162,9 @@ class GatewayClient:
         - Spins up an Iroh node + a loopback proxy and returns a
           GatewayClient bound to the proxy URL.
         """
-        from openagent.network.client.login import list_agents as coord_list_agents
-        from openagent.network.client.login import refresh_cert
-        from openagent.network.auth.device_cert import verify_cert
+        from openagent_client_transport.network.client.login import list_agents as coord_list_agents
+        from openagent_client_transport.network.client.login import refresh_cert
+        from openagent_client_transport.network.auth.device_cert import verify_cert
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         store = user_store.load()
@@ -187,7 +212,7 @@ class GatewayClient:
                     network_id=net.network_id,
                 )
                 user_store.write_cert(net, cert_wire)
-                from openagent.network.user_store import save
+                from openagent_client_transport.network.user_store import save
                 import time as _time
                 net.last_login_at = _time.time()
                 save(store)
@@ -197,7 +222,7 @@ class GatewayClient:
         else:
             await node.start()
 
-        from openagent.network.client.session import NetworkBinding
+        from openagent_client_transport.network.client.session import NetworkBinding
         binding = NetworkBinding(
             network_id=net.network_id,
             network_name=net.name,
@@ -256,10 +281,23 @@ class GatewayClient:
         self.agent_name = resp.get("agent_name")
         self.agent_version = resp.get("version")
         self.agent_handle = resp.get("handle")
-        self.network_id = resp.get("network")
+        self.network_name = resp.get("network")
+        reported_network_id = resp.get("network_id")
+        if self.network_id is not None:
+            if reported_network_id != self.network_id:
+                raise ConnectionError(
+                    "gateway authenticated a different network than the device certificate"
+                )
+        else:
+            # Legacy/raw debugging clients may still retain the old field for
+            # display. They do not get local capabilities because there is no
+            # certified device id to bind the dedicated socket to.
+            self.network_id = reported_network_id or resp.get("network")
         self._listener_task = asyncio.create_task(self._listen())
+        await self._start_local_capabilities()
 
     async def disconnect(self) -> None:
+        await self._stop_local_capabilities()
         if self._listener_task:
             self._listener_task.cancel()
         if self._ws:
@@ -283,6 +321,270 @@ class GatewayClient:
                 pass
         self._opened_sessions.clear()
         self._stream_pending.clear()
+
+    async def _start_local_capabilities(self) -> None:
+        """Offer this interactive CLI computer over the dedicated capability WS.
+
+        Missing host-tools, disabled consent, and older gateways are all clean
+        degradations: chat remains connected and server tools remain unchanged.
+        """
+        try:
+            from openagent_host_tools import CapabilityBridge, LocalCapabilityClient
+        except ImportError:
+            logger.info("openagent-host-tools is not installed; local tools unavailable")
+            return
+
+        if not self.network_id or not self._certified_device_id:
+            logger.info("gateway supplied no certified account/network id; local tools disabled")
+            return
+        host = LocalCapabilityClient()
+        try:
+            await host.start()
+            self._capability_host = host
+            self._capabilities_stopping = False
+            await self._connect_capabilities_once()
+            self._capability_supervisor_task = asyncio.create_task(
+                self._supervise_capabilities(), name="cli-capability-supervisor"
+            )
+        except Exception as exc:  # noqa: BLE001 - compatibility degradation
+            logger.info("local capability connection unavailable: %s", exc)
+            try:
+                await host.close()
+            except Exception:
+                pass
+            if self._capability_ws is not None:
+                try:
+                    await self._capability_ws.close()
+                except Exception:
+                    pass
+            self._capability_host = None
+            self._capability_bridge = None
+            self._capability_ws = None
+
+    async def _connect_capabilities_once(self) -> bool:
+        host = self._capability_host
+        if host is None or self._session is None or not self.network_id:
+            return False
+        status = await host.status()
+        if not bool((status.get("consent") or {}).get("enabled")):
+            return False
+        base = self.url[:-3] if self.url.endswith("/ws") else self.url.rsplit("/", 1)[0]
+        capability_url = f"{base}/ws/capabilities"
+        ws = await self._session.ws_connect(capability_url)
+        generation = self._capability_generation
+        from openagent_host_tools import CapabilityBridge
+
+        bridge = CapabilityBridge(
+            host,
+            client_instance_id=self.client_instance_id,
+            send_json=ws.send_json,
+            generation=generation,
+            trusted_account_id=self.network_id,
+            trusted_device_id=self._certified_device_id,
+            on_transport_lost=lambda: self._schedule_capability_transport_close(
+                ws, bridge
+            ),
+        )
+        self._capability_principal = dict(bridge.principal)
+        try:
+            await bridge.hello()
+            ack_msg = await ws.receive(timeout=10)
+            if ack_msg.type != aiohttp.WSMsgType.TEXT:
+                raise ConnectionError("capability gateway closed before hello acknowledgement")
+            ack = json.loads(ack_msg.data)
+            if ack.get("type") != _CAPABILITY_HELLO_ACK or ack.get("accepted") is not True:
+                raise ConnectionError(f"capability hello rejected: {ack}")
+            if ack.get("protocol") != _CAPABILITY_PROTOCOL:
+                raise ConnectionError("capability hello acknowledged a different protocol")
+            if ack.get("device_id") != self._certified_device_id:
+                raise ConnectionError("capability hello acknowledged a different device")
+            if ack.get("account_id") != self.network_id:
+                raise ConnectionError("capability hello acknowledged a different account")
+            if ack.get("client_instance_id") != self.client_instance_id:
+                raise ConnectionError("capability hello acknowledged a different client instance")
+            if ack.get("generation") is None or int(ack["generation"]) != generation:
+                raise ConnectionError("capability hello acknowledged a stale generation")
+            self._capability_bridge = bridge
+            self._capability_ws = ws
+            bridge.activate_events()
+        except Exception:
+            if self._capability_bridge is bridge:
+                self._capability_bridge = None
+            if self._capability_ws is ws:
+                self._capability_ws = None
+            await bridge.close()
+            await ws.close()
+            raise
+        self._capability_listener_task = asyncio.create_task(
+            self._listen_capabilities(), name="cli-capability-listener"
+        )
+        self._capability_heartbeat_task = asyncio.create_task(
+            self._heartbeat_capabilities(), name="cli-capability-heartbeat"
+        )
+        return True
+
+    def _schedule_capability_transport_close(self, ws, bridge) -> None:
+        """Drop only the exact capability WS after local-host transport loss.
+
+        This callback is deliberately synchronous: it is invoked from the
+        broker listener, so awaiting WebSocket/bridge teardown there would
+        create a listener-close cycle. The supervisor observes the WS close,
+        tears down this bridge without releasing its stable principal, and
+        reconnects with the same instance and generation.
+        """
+
+        if self._capabilities_stopping:
+            return
+        active = self._capability_transport_close_task
+        if active is not None and not active.done():
+            return
+
+        async def close_exact_socket() -> None:
+            if self._capability_ws is not ws or self._capability_bridge is not bridge:
+                return
+            try:
+                await ws.close(code=1011, message=b"local capability host transport lost")
+            except TypeError:
+                # Lightweight/fake WebSocket implementations may only expose
+                # close() without aiohttp's optional code/message parameters.
+                await ws.close()
+            except Exception:
+                logger.debug("failed to close lost capability transport", exc_info=True)
+
+        task = asyncio.create_task(
+            close_exact_socket(), name="cli-capability-host-transport-lost"
+        )
+        self._capability_transport_close_task = task
+
+        def clear(completed: asyncio.Task) -> None:
+            if self._capability_transport_close_task is completed:
+                self._capability_transport_close_task = None
+
+        task.add_done_callback(clear)
+
+    async def _supervise_capabilities(self) -> None:
+        backoff = 0.25
+        try:
+            while not self._capabilities_stopping:
+                active = [
+                    task
+                    for task in (
+                        self._capability_listener_task,
+                        self._capability_heartbeat_task,
+                    )
+                    if task is not None
+                ]
+                if active:
+                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    await self._close_capability_connection(release_principal=False)
+                if self._capabilities_stopping or not self.is_connected:
+                    return
+                await asyncio.sleep(backoff)
+                try:
+                    connected = await self._connect_capabilities_once()
+                except Exception:
+                    connected = False
+                    logger.debug("capability reconnect failed", exc_info=True)
+                backoff = 0.25 if connected else min(backoff * 2, 5.0)
+        except asyncio.CancelledError:
+            raise
+
+    async def _listen_capabilities(self) -> None:
+        ws = self._capability_ws
+        bridge = self._capability_bridge
+        if ws is None or bridge is None:
+            return
+        try:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    break
+                try:
+                    frame = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                await bridge.handle(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("capability listener ended", exc_info=True)
+
+    async def _heartbeat_capabilities(self) -> None:
+        bridge = self._capability_bridge
+        host = self._capability_host
+        if bridge is None or host is None:
+            return
+        last_enabled = True
+        try:
+            while True:
+                await asyncio.sleep(15)
+                status = await host.status()
+                enabled = bool((status.get("consent") or {}).get("enabled"))
+                if enabled != last_enabled:
+                    await bridge.catalog_update()
+                    last_enabled = enabled
+                await bridge.heartbeat()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("capability heartbeat ended", exc_info=True)
+
+    async def _stop_local_capabilities(self) -> None:
+        self._capabilities_stopping = True
+        if self._capability_supervisor_task is not None:
+            self._capability_supervisor_task.cancel()
+            await asyncio.gather(self._capability_supervisor_task, return_exceptions=True)
+            self._capability_supervisor_task = None
+        await self._close_capability_connection(release_principal=False)
+        transport_close = self._capability_transport_close_task
+        if transport_close is not None and transport_close is not asyncio.current_task():
+            transport_close.cancel()
+            await asyncio.gather(transport_close, return_exceptions=True)
+        self._capability_transport_close_task = None
+        if self._capability_host is not None:
+            try:
+                if self._capability_principal is not None:
+                    await self._capability_host.release_principal(
+                        self._capability_principal,
+                    )
+            except Exception:
+                pass
+            try:
+                await self._capability_host.close()
+            except Exception:
+                pass
+        self._capability_host = None
+        self._capability_principal = None
+
+    async def _close_capability_connection(self, *, release_principal: bool = False) -> None:
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in (
+                self._capability_heartbeat_task,
+                self._capability_listener_task,
+            )
+            if task is not None and task is not current
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._capability_heartbeat_task = None
+        self._capability_listener_task = None
+        if self._capability_bridge is not None:
+            try:
+                await self._capability_bridge.close(
+                    release_principals=release_principal,
+                )
+            except Exception:
+                pass
+        if self._capability_ws is not None:
+            try:
+                await self._capability_ws.close()
+            except Exception:
+                pass
+        self._capability_bridge = None
+        self._capability_ws = None
 
     async def _listen(self) -> None:
         async for msg in self._ws:
@@ -384,13 +686,15 @@ class GatewayClient:
         turn-final frame as a safety net, then cleared on return.
         """
         if session_id not in self._opened_sessions:
-            await self._ws.send_json(event_to_wire(SessionOpen(
+            open_frame = event_to_wire(SessionOpen(
                 session_id=session_id,
                 ts_ms=now_ms(),
                 profile="batched",
                 client_kind="cli",
                 speak=False,
-            )))
+            ))
+            open_frame["client_instance_id"] = self.client_instance_id
+            await self._ws.send_json(open_frame)
             self._opened_sessions.add(session_id)
 
         collector = StreamCollector()
@@ -455,12 +759,14 @@ class GatewayClient:
         language: str | None = None,
         client_kind: str | None = "cli",
     ) -> None:
-        await self._ws.send_json(event_to_wire(SessionOpen(
+        open_frame = event_to_wire(SessionOpen(
             session_id=session_id, ts_ms=now_ms(),
             profile=profile,  # type: ignore[arg-type]
             language=language,
             client_kind=client_kind,
-        )))
+        ))
+        open_frame["client_instance_id"] = self.client_instance_id
+        await self._ws.send_json(open_frame)
 
     async def send_session_close(self, session_id: str) -> None:
         await self._ws.send_json(event_to_wire(SessionClose(

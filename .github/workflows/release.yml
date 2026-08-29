@@ -10,23 +10,68 @@ permissions:
   id-token: write
 
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Acquire the consumer-pinned host-tools dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/acquire-host-tools.py \
+            --platform linux-x64 \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
+          python -m pip install "$RUNNER_TEMP/openagent-host-tools.whl"
+      - name: Run the full CLI suite
+        run: |
+          python -m pip install -e . pytest
+          python -m pytest -q
+
   cli:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-          - os: ubuntu-latest
-          - os: windows-latest
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: macos-15
+            platform: darwin-arm64
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: win32-x64
+          - os: windows-11-arm
+            platform: win32-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Acquire checksum-pinned host-tools wheel and native bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/acquire-host-tools.py \
+            --platform '${{ matrix.platform }}' \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
+          echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.platform }}" >> "$GITHUB_ENV"
       - name: Install CLI deps + PyInstaller
-        run: pip install -e . pyinstaller
+        shell: bash
+        run: |
+          python -m pip install "$RUNNER_TEMP/openagent-host-tools.whl"
+          python -m pip install -e . pyinstaller
       - name: Build CLI executable
+        env:
+          OPENAGENT_RELEASE_BUILD: '1'
         run: pyinstaller cli.spec --clean --noconfirm
       - name: Sign + notarize macOS CLI binary (+ build stapled .pkg)
         if: runner.os == 'macOS'
@@ -38,14 +83,21 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          OPENAGENT_REQUIRE_SIGNING: '1'
         shell: bash
-        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli com.openagent.cli /usr/local/bin
+        run: >-
+          bash scripts/sign-notarize-macos.sh
+          dist/openagent-cli com.openagent.cli /usr/local/bin ""
+          "$OPENAGENT_HOST_TOOLS_BUNDLE"
       - name: Package + checksum
         shell: bash
         run: bash scripts/package-release.sh openagent-cli dist
+      - name: Smoke frozen broker twice, explicit plugin, and five-module catalog
+        shell: bash
+        run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli
       - uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ matrix.os }}
+          name: cli-${{ matrix.platform }}
           path: |
             dist/openagent-cli-*.tar.gz
             dist/openagent-cli-*.zip

@@ -27,16 +27,12 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
-# Deferred import: src.client pulls in openagent.gateway.protocol which
-# (in the installed server package) does ``from src.gateway.commands import
-# COMMANDS`` at module level — a ``from src.*`` import that resolves to the
-# CLI's own src/ rather than the server's src/ and therefore blows up.
-# With ``from __future__ import annotations`` already active, every
-# GatewayClient annotation in this file is a lazy string, so no NameError
-# at definition time.  The three actual call sites below import lazily.
+# Deferred import: keep the network stack out of command paths such as
+# ``local-tools status`` that do not need to dial a Gateway. With postponed
+# annotations, every GatewayClient annotation below remains safe.
 # TERMINAL_* constants used in _run_terminal are also imported there.
 if False:  # TYPE_CHECKING placeholder — satisfies IDEs without importing
-    from src.client import GatewayClient, TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR  # noqa: F401
+    from openagent_cli.client import GatewayClient, TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR  # noqa: F401
 
 console = Console()
 
@@ -314,6 +310,108 @@ def cli():
     pass
 
 
+@cli.group("local-tools")
+def local_tools_group():
+    """Manage persistent device-level access to this computer."""
+    pass
+
+
+@local_tools_group.command("enable")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the consent confirmation")
+def local_tools_enable(assume_yes: bool):
+    """Allow interactive OpenAgent turns unrestricted local computer access."""
+    if not assume_yes:
+        console.print(
+            "[yellow]This grants interactive OpenAgent turns unrestricted access to this "
+            "computer's files, shell, editor, and enabled local MCPs.[/yellow]"
+        )
+        if not Confirm.ask("Enable persistent local tools for this device?", default=False):
+            console.print("[dim]No changes.[/dim]")
+            return
+    asyncio.run(_set_local_tools(True))
+
+
+@local_tools_group.command("disable")
+def local_tools_disable():
+    """Revoke local computer access immediately for this device."""
+    asyncio.run(_set_local_tools(False))
+
+
+@local_tools_group.command("status")
+def local_tools_status():
+    """Show consent, broker health, built-ins and configured local MCPs."""
+    asyncio.run(_show_local_tools_status())
+
+
+async def _open_local_tools_client():
+    try:
+        from openagent_host_tools import LocalCapabilityClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "openagent-host-tools is not installed; reinstall or update openagent-cli"
+        ) from exc
+    client = LocalCapabilityClient()
+    await client.start()
+    return client
+
+
+async def _set_local_tools(enabled: bool) -> None:
+    client = None
+    try:
+        client = await _open_local_tools_client()
+        await client.set_consent(enabled)
+        status = await client.status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not update local tools:[/red] {exc}")
+        return
+    finally:
+        if client is not None:
+            await client.close()
+    if enabled:
+        available = sum(1 for item in status.get("servers", []) if item.get("available"))
+        console.print(
+            f"[green]Local tools enabled persistently.[/green] {available} module(s) available."
+        )
+    else:
+        console.print("[green]Local tools disabled.[/green] Active local calls were revoked.")
+
+
+async def _show_local_tools_status() -> None:
+    client = None
+    try:
+        client = await _open_local_tools_client()
+        status = await client.status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not read local tools status:[/red] {exc}")
+        return
+    finally:
+        if client is not None:
+            await client.close()
+    consent = status.get("consent") or {}
+    state = "enabled" if consent.get("enabled") else "disabled"
+    colour = "green" if consent.get("enabled") else "yellow"
+    console.print(f"Local tools: [{colour}]{state}[/{colour}]")
+    console.print(f"[dim]Consent: {status.get('consent_path')}[/dim]")
+    console.print(f"[dim]MCP config: {status.get('config_path')}[/dim]")
+    table = Table(show_header=True)
+    table.add_column("Module")
+    table.add_column("Source")
+    table.add_column("Health")
+    table.add_column("Tools", justify="right")
+    for item in status.get("servers", []):
+        available = bool(item.get("available"))
+        health = "[green]available[/green]" if available else (
+            f"[dim]{item.get('unavailable_reason') or 'unavailable'}[/dim]"
+        )
+        table.add_row(
+            str(item.get("name")),
+            str(item.get("source", "builtin")),
+            health,
+            str(len(item.get("tools") or [])),
+        )
+    console.print(table)
+
+
 @cli.command()
 @click.argument("target")
 @click.option("--password", default=None, help="Password (omit to be prompted securely)")
@@ -345,16 +443,19 @@ async def _run_connect(
     handle_override: str | None,
     target_agent_handle: str | None,
 ):
-    from openagent.network.cli_commands import parse_handle_at_network
-    from openagent.network import user_store
-    from openagent.network.client.login import (
+    from openagent_client_transport.helpers import (
+        coordinator_node_id_to_pubkey_bytes,
+        parse_handle_at_network,
+    )
+    from openagent_client_transport.network import user_store
+    from openagent_client_transport.network.client.login import (
         LoginError,
         register as net_register,
         login as net_login,
     )
-    from openagent.network.identity import load_or_create_identity
-    from openagent.network.iroh_node import IrohNode
-    from openagent.network.ticket import InviteTicket, TicketError, looks_like_ticket
+    from openagent_client_transport.network.identity import load_or_create_identity
+    from openagent_client_transport.network.iroh_node import IrohNode
+    from openagent_client_transport.network.ticket import InviteTicket, TicketError, looks_like_ticket
     import getpass
 
     # Resolve target → (handle, network_name, coordinator_node_id?, invite_code?, ticket_role)
@@ -408,8 +509,6 @@ async def _run_connect(
     if not password:
         console.print("[red]Password is required.[/red]")
         return
-
-    from openagent.network.peers import coordinator_node_id_to_pubkey_bytes
 
     device_identity = load_or_create_identity(user_store.user_identity_path())
     node = IrohNode(device_identity)
@@ -469,7 +568,7 @@ async def _run_connect(
                 console.print(f"[red]Login failed:[/red] {e}")
                 return
             # The cert tells us the canonical network_id — verify and store.
-            from openagent.network.auth.device_cert import verify_cert
+            from openagent_client_transport.network.auth.device_cert import verify_cert
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
             cert = verify_cert(
                 cert_wire,
@@ -537,7 +636,7 @@ async def _run_connect(
         raise
 
     try:
-        from src.client import GatewayClient  # lazy: avoids module-level import of openagent.gateway
+        from openagent_cli.client import GatewayClient
         client = await GatewayClient.from_network(
             handle=handle,
             network_name=network_name,
@@ -569,7 +668,7 @@ async def _run_connect(
 @click.argument("network_name", required=False, default=None)
 def logout_cmd(network_name: str | None):
     """Drop a network membership locally (cert + entry in the user store)."""
-    from openagent.network import user_store
+    from openagent_client_transport.network import user_store
 
     store = user_store.load()
     if network_name is None:
@@ -591,7 +690,7 @@ def logout_cmd(network_name: str | None):
 @cli.command("networks")
 def networks_cmd():
     """List networks this device has joined."""
-    from openagent.network import user_store
+    from openagent_client_transport.network import user_store
 
     store = user_store.load()
     if not store.networks:
@@ -617,10 +716,10 @@ def agents_cmd(network_name: str | None):
 
 
 async def _run_agents_cli(network_name: str | None):
-    from openagent.network import user_store
-    from openagent.network.client.login import list_agents as coord_list_agents
-    from openagent.network.identity import load_or_create_identity
-    from openagent.network.iroh_node import IrohNode
+    from openagent_client_transport.network import user_store
+    from openagent_client_transport.network.client.login import list_agents as coord_list_agents
+    from openagent_client_transport.network.identity import load_or_create_identity
+    from openagent_client_transport.network.iroh_node import IrohNode
 
     store = user_store.load()
     if network_name is None:
@@ -662,7 +761,7 @@ async def _run_agents_cli(network_name: str | None):
 @click.argument("agent_handle")
 def use_cmd(agent_handle: str):
     """Set the default agent the next ``connect`` will pick."""
-    from openagent.network import user_store
+    from openagent_client_transport.network import user_store
 
     store = user_store.load()
     store.active_agent = agent_handle
@@ -682,7 +781,7 @@ async def _open_gateway_for_rest(network_name: str | None, password: str | None)
     and returns the live client. Caller is responsible for closing.
     """
     import getpass
-    from openagent.network import user_store
+    from openagent_client_transport.network import user_store
 
     store = user_store.load()
     if network_name is None:
@@ -702,7 +801,7 @@ async def _open_gateway_for_rest(network_name: str | None, password: str | None)
     # The cert may be valid (no password needed) or expired (prompt).
     # GatewayClient.from_network handles both branches — we just need
     # to surface the prompt before it raises PermissionError.
-    from src.client import GatewayClient  # lazy: avoids module-level import of openagent.gateway
+    from openagent_cli.client import GatewayClient
     try:
         client = await GatewayClient.from_network(
             handle=net.handle, network_name=network_name,
@@ -975,7 +1074,7 @@ async def _run_terminal(
     import base64
     import shutil
     import uuid
-    from src.client import TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR  # lazy import
+    from openagent_cli.client import TERMINAL_OUTPUT, TERMINAL_EXIT, TERMINAL_ERROR
 
     if os.name != "posix":
         console.print("[red]The terminal command needs a POSIX terminal (macOS/Linux).[/red]")
@@ -3029,6 +3128,13 @@ async def _send_files(client: GatewayClient, filepaths: list[str], session_id: s
 
 
 def main():
+    # A frozen CLI also embeds host-tools. Its broker launcher re-execs the
+    # current executable with this private flag, so intercept it before Click.
+    if getattr(sys, "frozen", False) and sys.argv[1:2] in (["--broker"], ["--direct"]):
+        from openagent_host_tools.stdio import main as host_tools_main
+
+        host_tools_main()
+        return
     cli()
 
 
