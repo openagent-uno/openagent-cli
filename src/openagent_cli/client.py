@@ -380,6 +380,7 @@ class GatewayClient:
             send_json=ws.send_json,
             generation=generation,
             trusted_account_id=self.network_id,
+            trusted_network_id=self.network_id,
             trusted_device_id=self._certified_device_id,
             on_transport_lost=lambda: self._schedule_capability_transport_close(
                 ws, bridge

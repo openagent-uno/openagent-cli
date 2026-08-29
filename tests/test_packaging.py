@@ -215,12 +215,13 @@ def test_current_host_producer_archive_is_accepted_when_available(tmp_path):
         return
     manifest = producer / "dist" / platform / "bundle-manifest.json"
     assert manifest.is_file()
+    producer_version = str(json.loads(manifest.read_text())["version"])
     lock = tmp_path / "producer-lock.json"
     lock.write_text(json.dumps({
         "schema": 1,
-        "version": "0.1.0",
+        "version": producer_version,
         "source_repository": "openagent-uno/openagent-host-tools",
-        "source_ref": "v0.1.0",
+        "source_ref": f"v{producer_version}",
         "source_commit": "b" * 40,
         "platforms": {
             platform: {

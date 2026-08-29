@@ -210,6 +210,7 @@ async def test_capability_socket_uses_same_instance_and_dedicated_path(monkeypat
         hello = capability_ws.sent[0]
         assert hello["type"] == "capability_hello"
         assert hello["client_instance_id"] == client.client_instance_id
+        assert hello["network_id"] == "account-1"
         assert hello["servers"][0]["name"] == "filesystem"
     finally:
         await client._stop_local_capabilities()
