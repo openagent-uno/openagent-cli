@@ -21,7 +21,12 @@ dependencies = [
     "iroh==0.35.0",
     "cbor2>=5.6",
     "srptools>=1.0",
-    "cryptography>=42",
+    # 46.0.3 is the newest cryptography release with a Windows ARM64 wheel.
+    # Pin that platform to the published ABI3 artifact instead of attempting an
+    # OpenSSL source build on every user/release install. Other platforms remain
+    # on the normal rolling lower bound.
+    "cryptography>=42; platform_system != 'Windows' or platform_machine != 'ARM64'",
+    "cryptography==46.0.3; platform_system == 'Windows' and platform_machine == 'ARM64'",
 ]
 
 [tool.setuptools]

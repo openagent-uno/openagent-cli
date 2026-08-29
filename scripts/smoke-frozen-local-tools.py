@@ -8,6 +8,7 @@ import base64
 import binascii
 import json
 import os
+import platform
 import queue
 import re
 import subprocess
@@ -377,8 +378,8 @@ async def _exercise_native_sidecars_through_broker(
     primary_error: BaseException | None = None
     try:
         computer = await _exercise_computer_control(client, principal, pass_number)
-        await _exercise_agent_in_chrome(client, principal, pass_number)
-        return f"computer-control({computer}); agent-in-chrome(navigate+read=granted)"
+        chrome = await _exercise_agent_in_chrome(client, principal, pass_number)
+        return f"computer-control({computer}); agent-in-chrome({chrome})"
     except BaseException as exc:
         primary_error = exc
         raise
@@ -579,7 +580,7 @@ async def _exercise_agent_in_chrome(
     client,
     principal: dict,
     pass_number: int,
-) -> None:
+) -> str:
     page_server = await asyncio.start_server(_chrome_smoke_page, "127.0.0.1", 0)
     assert page_server.sockets
     page_port = int(page_server.sockets[0].getsockname()[1])
@@ -592,6 +593,8 @@ async def _exercise_agent_in_chrome(
             args={"createIfEmpty": True},
             call_id=f"frozen-chrome-context-{pass_number}",
         )
+        if _is_expected_missing_chrome(context):
+            return "expected-linux-arm64-prerequisite"
         _require_tool_success(context, "agent-in-chrome tab discovery")
         try:
             first_line = _tool_result_text(context).splitlines()[0]
@@ -626,9 +629,39 @@ async def _exercise_agent_in_chrome(
                 "frozen agent-in-chrome did not read the deterministic local page: "
                 f"{_tool_result_text(page)!r}"
             )
+        return "navigate+read=granted"
     finally:
         page_server.close()
         await page_server.wait_closed()
+
+
+def _is_expected_missing_chrome(result: dict) -> bool:
+    """Accept one release-runner prerequisite gap without hiding regressions.
+
+    Only GitHub's Linux ARM64 matrix entry opts in. Even there, the real
+    agent-in-chrome sidecar must have launched and returned its stable
+    "tried: none" error; a found-but-broken browser or any other failure stays
+    release-blocking. Other architectures remain strict so losing Chrome from
+    a previously capable runner fails loudly.
+    """
+
+    if os.environ.get("OPENAGENT_RELEASE_ALLOW_MISSING_CHROME") != "1":
+        return False
+    if not sys.platform.startswith("linux"):
+        return False
+    if platform.machine().lower() not in {"arm64", "aarch64"}:
+        return False
+    if result.get("isError") is not True:
+        return False
+    text = _tool_result_text(result).lower()
+    return all(
+        marker in text
+        for marker in (
+            "could not launch any chromium-based browser",
+            "tried: none",
+            "set openagent_chrome_binary",
+        )
+    )
 
 
 def _require_tool_success(result: dict, label: str) -> None:

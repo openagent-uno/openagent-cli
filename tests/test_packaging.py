@@ -7,8 +7,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 from importlib.metadata import version as distribution_version
 from pathlib import Path
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +54,44 @@ def test_cli_owns_no_top_level_src_distribution_package():
     assert not (ROOT / "src" / "__init__.py").exists()
     assert not (ROOT / "src" / "main.py").exists()
     assert not (ROOT / "src" / "client.py").exists()
+
+
+def test_windows_arm64_selects_a_published_cryptography_wheel_line():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    cryptography = [
+        Requirement(value)
+        for value in project["dependencies"]
+        if Requirement(value).name == "cryptography"
+    ]
+
+    def selected(system: str, machine: str) -> list[Requirement]:
+        environment = default_environment()
+        environment.update(platform_system=system, platform_machine=machine)
+        return [
+            requirement
+            for requirement in cryptography
+            if requirement.marker is None or requirement.marker.evaluate(environment)
+        ]
+
+    windows_arm = selected("Windows", "ARM64")
+    assert len(windows_arm) == 1
+    assert str(windows_arm[0].specifier) == "==46.0.3"
+    assert Version("46.0.3") in windows_arm[0].specifier
+    assert Version("47.0.0") not in windows_arm[0].specifier
+    assert Version("50.0.1") not in windows_arm[0].specifier
+
+    for system, machine in (("Windows", "AMD64"), ("Linux", "aarch64")):
+        normal = selected(system, machine)
+        assert len(normal) == 1
+        assert Version("50.0.1") in normal[0].specifier
+
+
+def test_release_matrix_resolves_cli_and_host_wheel_together_and_gates_browser():
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert '"$OPENAGENT_HOST_TOOLS_WHEEL"\n          -e . pyinstaller' in workflow
+    assert 'python -m pip install "$OPENAGENT_HOST_TOOLS_WHEEL"' not in workflow
+    assert "OPENAGENT_RELEASE_ALLOW_MISSING_CHROME" in workflow
+    assert "matrix.platform == 'linux-arm64'" in workflow
 
 
 def test_pyinstaller_script_invokes_the_cli_entrypoint():
