@@ -110,6 +110,15 @@ jobs:
           set -euo pipefail
           pyinstaller cli.spec --clean --noconfirm
           bash scripts/package-release.sh openagent-cli dist
+      - name: Verify exact native ARM64 release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(PYTHONPATH=src python -c 'from openagent_cli import __version__; print(__version__)')
+          test -f "dist/openagent-cli-$version-windows-arm64.zip"
+          test -f "dist/openagent-cli-$version-windows-arm64.zip.sha256"
+          test ! -e "dist/openagent-cli-$version-windows-x64.zip"
+          bash scripts/test-release-package.sh openagent-cli dist "$version"
       - name: Run two native ARM64 broker and browser passes
         shell: bash
         run: python scripts/smoke-frozen-local-tools.py dist/openagent-cli

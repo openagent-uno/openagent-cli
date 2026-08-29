@@ -483,6 +483,66 @@ def test_linux_release_packaging_uses_cli_distribution_metadata_in_clean_checkou
         assert "host-tools/openagent-capability-host" in names
 
 
+def test_windows_arm64_release_name_follows_native_build_python(tmp_path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "openagent-cli.exe").write_bytes(b"frozen-arm64-cli")
+    native = tmp_path / "verified-host-tools"
+    native.mkdir()
+    (native / "bundle-manifest.json").write_text("{}", encoding="utf-8")
+    (native / "openagent-capability-host.exe").write_bytes(b"native-host")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    version = distribution_version("openagent-cli")
+    archive = f"openagent-cli-{version}-windows-arm64.zip"
+    fake_python = fake_bin / "build-python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$2\" in\n"
+        "  *platform.machine*) echo ARM64 ;;\n"
+        f"  *importlib.metadata*) echo {version} ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_powershell = fake_bin / "powershell.exe"
+    fake_powershell.write_text(
+        f"#!/usr/bin/env bash\n: > '{archive}'\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_powershell.chmod(0o755)
+
+    env = {
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PYTHON": str(fake_python),
+        "RUNNER_OS": "Windows",
+        "OPENAGENT_HOST_TOOLS_BUNDLE": str(native),
+    }
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts" / "package-release.sh"),
+            "openagent-cli",
+            str(dist),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (dist / archive).is_file()
+    assert (dist / f"{archive}.sha256").is_file()
+    assert not (dist / f"openagent-cli-{version}-windows-x64.zip").exists()
+
+    verifier = (ROOT / "scripts" / "test-release-package.sh").read_text()
+    assert "platform.machine()" in verifier
+    assert 'release_arch_raw="$(uname -m)"' not in verifier
+
+
 def test_macos_release_fails_closed_and_reads_cli_distribution_version():
     signing = (ROOT / "scripts" / "sign-notarize-macos.sh").read_text()
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
